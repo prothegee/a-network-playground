@@ -1,0 +1,8 @@
+.git
+.cache
+.log
+.logs
+.public
+
+build
+

@@ -1,0 +1,53 @@
+##
+## directory
+##
+/.bin
+/.out
+/.log
+/.logs
+/.build
+/.cache
+/.target
+
+.svelte-kit
+
+bin
+out
+log
+logs
+build
+cache
+target
+
+node_modules
+
+##
+## extension
+##
+*.bak*
+*.exe*
+*.zip
+*Zone.Identifier
+
+##
+## file: include
+##
+/.configs/config.*.json
+/.nvim/*.json
+/.vscode/*.json
+/.zed/*.json
+
+/CMakePresets.json
+
+backend_*.o
+backend_*.exe
+
+compile_commands.json
+
+##
+## file: exclude
+##
+!/.configs/config.*.json.template
+!/.nvim/*.json.template
+!/.vscode/*.json.template
+!/.zed/*.json.template
