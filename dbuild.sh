@@ -1,13 +1,19 @@
 clear;
-mkdir -p log public;
+set -e;
+mkdir -p logs public;
+
+source env.sh;
 
 # backend_c
-# todo
+gcc -o ./backend_c.o ./backend_c/main.c -std=c23 -g;
 
 # --------------------------------------------------------- #
 
 # backend_cc
 g++ -o ./backend_cc.o ./backend_cc/main.cc -std=c++23 -g; #-O3;
+
+# backend_cc_drogon
+_build_backend_cc_drogon;
 
 # --------------------------------------------------------- #
 

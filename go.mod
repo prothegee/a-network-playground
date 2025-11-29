@@ -1,4 +1,4 @@
-module a-network-with-stl
+module a-network-playground
 
 go 1.25
 
