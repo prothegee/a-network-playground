@@ -29,6 +29,11 @@ node_modules
 *.zip
 *Zone.Identifier
 
+*.a
+*.so
+*.dll
+*.lib
+
 ##
 ## file: include
 ##
@@ -41,6 +46,7 @@ node_modules
 
 backend_*.o
 backend_*.exe
+backend_*.exec
 
 compile_commands.json
 
@@ -51,3 +57,4 @@ compile_commands.json
 !/.nvim/*.json.template
 !/.vscode/*.json.template
 !/.zed/*.json.template
+

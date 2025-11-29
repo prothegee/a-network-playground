@@ -43,7 +43,7 @@ func registerHandler() {
 func main() {
 	var address, port = "0.0.0.0", ":9003"
 
-	fmt.Printf("main.go: run on %s%s\n", address, port)
+	fmt.Printf("backend_go: run on %s%s\n", address, port)
 
 	registerHandler()
 
