@@ -8,6 +8,8 @@ import (
 	"net/http"
 )
 
+const ADDRESS = "0.0.0.0:9004"
+
 // --------------------------------------------------------- //
 
 const HTTP_CONTENT_TYPE_HINT = "Content-Type"
@@ -75,12 +77,10 @@ func registerHandler() {
 // --------------------------------------------------------- //
 
 func main() {
-	var address, port = "0.0.0.0", ":9003"
-
-	fmt.Printf("backend_go: run on %s%s\n", address, port)
+	fmt.Printf("backend_go: run on %s\n", ADDRESS)
 
 	registerHandler()
 
-	log.Fatal(http.ListenAndServe(port, nil))
+	log.Fatal(http.ListenAndServe(ADDRESS, nil))
 }
 
