@@ -8,6 +8,8 @@ programming language implementations are:
 - [?] cc_drogon
 - [?] go
 - [?] go_fiber
+- [?] rust
+- [?] rust_ohkami
 
 __*IMPORTANT*:__
 
@@ -33,7 +35,21 @@ __*IMPORTANT*:__
 
 ## goal endpoint pattern
 
-- TBA
+- `/{lang_framework}`:
+    - application/text
+    - content: `home`
+
+- `/{lang_framework}/json`:
+    - application/json
+    - content:
+        ```json
+        {
+            "decimal": 3.14,
+            "string": "string",
+            "round": 69,
+            "boolean": true
+        }
+        ```
 
 <br>
 
