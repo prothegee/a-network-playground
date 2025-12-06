@@ -13,12 +13,12 @@ programming language implementations are:
 
 __*IMPORTANT*:__
 
-- {lang_framework} mean:
+- `{lang-framework}` mean:
     - it has lang with/without framework
     - says it doesn't use any framework and just only use stl in go, so:
-        - `/go/user`
+        - `/go/foo`
     - if it using fiber, it should be
-        - `/go_fiber/user`
+        - `/go-fiber/foo`
 
 - check [goal endpoint pattern](#goal endpoint pattern), each section has it own purpose
 
@@ -35,11 +35,11 @@ __*IMPORTANT*:__
 
 ## goal endpoint pattern
 
-- `/{lang_framework}`:
-    - application/text
+- `/{lang-framework}`:
+    - text/plain
     - content: `home`
 
-- `/{lang_framework}/json`:
+- `/{lang-framework}/json`:
     - application/json
     - content:
         ```json
