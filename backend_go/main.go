@@ -1,8 +1,9 @@
 package main
 
 import (
-	"io"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 )
@@ -12,30 +13,63 @@ import (
 const HTTP_CONTENT_TYPE_HINT = "Content-Type"
 
 const HTTP_CONTENT_TYPE_HINT_APP_TEXT = "text/plain"
-const HTTP_CONTENT_TYPE_HINT_APP_HTML = "application/html"
 const HTTP_CONTENT_TYPE_HINT_APP_JSON = "application/json"
+
+const HTTP_RESP_MESSAGE_METHOD_NOT_ALLOWED = "Method Not Allowed"
+const HTTP_RESP_MESSAGE_INTERNAL_SERVER_ERROR = "Internal Server Error"
 
 // --------------------------------------------------------- //
 
-// json grpc to cpp
+type TypeRespJson struct {
+	Decimal float64 `json:"decimal"`
+	String string `json:"string"`
+	Round int32 `json:"round"`
+	Boolean bool `json:"boolean"`
+}
 
-// json grpc from cpp
+// --------------------------------------------------------- //
 
 // json hello
+const JsonHandlerPath string = "/go/json"
+func JsonHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, HTTP_RESP_MESSAGE_METHOD_NOT_ALLOWED, http.StatusMethodNotAllowed)
+		return
+	}
 
-const HomeHandlerPath string = "/"
-func HomeHandler(w http.ResponseWriter, r* http.Request) {
-	var body = "home"
+	w.Header().Set(HTTP_CONTENT_TYPE_HINT, HTTP_CONTENT_TYPE_HINT_APP_JSON)
+
+	resp := TypeRespJson {
+		Decimal: 3.14,
+		String: "string",
+		Round: 69,
+		Boolean: true,
+	}
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, HTTP_RESP_MESSAGE_INTERNAL_SERVER_ERROR, http.StatusInternalServerError)
+	}
+}
+
+const HomeHandlerPath string = "/go"
+func HomeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, HTTP_RESP_MESSAGE_METHOD_NOT_ALLOWED, http.StatusMethodNotAllowed)
+		return
+	}
+
+	resp := "home"
 
 	w.Header().Set(HTTP_CONTENT_TYPE_HINT, HTTP_CONTENT_TYPE_HINT_APP_TEXT)
 
-	io.WriteString(w, body)
+	io.WriteString(w, resp)
 }
 
 // --------------------------------------------------------- //
 
 func registerHandler() {
 	http.HandleFunc(HomeHandlerPath, HomeHandler)
+	http.HandleFunc(JsonHandlerPath, JsonHandler)
 }
 
 // --------------------------------------------------------- //

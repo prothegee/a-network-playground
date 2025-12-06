@@ -49,6 +49,7 @@ backend_*.exe
 backend_*.exec
 
 compile_commands.json
+config.*
 
 ##
 ## file: exclude
@@ -57,4 +58,6 @@ compile_commands.json
 !/.nvim/*.json.template
 !/.vscode/*.json.template
 !/.zed/*.json.template
+
+!config.in.*
 

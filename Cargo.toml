@@ -1,0 +1,7 @@
+[workspace]
+members = [
+	"backend_rust",
+	"backend_rust_ohkami"
+]
+resolver = "2"
+

@@ -1,0 +1,6 @@
+[package]
+name = "backend_rust_ohkami"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
