@@ -1,3 +1,4 @@
+#/bin/sh
 clear;
 set -e;
 mkdir -p logs public;
@@ -10,7 +11,7 @@ gcc -o ./backend_c.o ./backend_c/main.c -std=c23 -g;
 # --------------------------------------------------------- #
 
 # backend_cc
-g++ -o ./backend_cc.o ./backend_cc/main.cc -std=c++23 -g; #-O3;
+_build_backend_cc;
 
 # backend_cc_drogon
 _build_backend_cc_drogon;
@@ -18,7 +19,9 @@ _build_backend_cc_drogon;
 # --------------------------------------------------------- #
 
 # backend_go
-go build -o ./backend_go.o ./backend_go; #-ldflags "-s -w";
+_build_backend_go;
+
+# backend_go_fiber
 
 # --------------------------------------------------------- #
 
