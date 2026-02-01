@@ -4,7 +4,7 @@
 # --------------------------------------------------------- #
 
 function _build_backend_cc() {
-	g++ -o ./backend_cc.o ./backend_cc/main.cc -std=c++23 -O3;
+	g++ -o ./backend_cc.o ./backend_cc/main.cc -std=c++23 -O3 -pthread;
 }
 
 function _build_backend_cc_drogon() {
