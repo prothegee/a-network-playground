@@ -268,7 +268,7 @@ private:
     }
     
     void handle_client(int client_fd) {
-        // FIX: Gunakan struct RAII sederhana (bukan unique_ptr dengan lambda)
+        // simple struct RAII instead of unique_ptr
         struct SocketCloser {
             int fd;
             explicit SocketCloser(int fd_) : fd(fd_) {}
