@@ -5,7 +5,3 @@ version = 4
 [[package]]
 name = "backend_rust"
 version = "0.1.0"
-
-[[package]]
-name = "backend_rust_ohkami"
-version = "0.1.0"
