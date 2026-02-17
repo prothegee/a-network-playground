@@ -512,7 +512,6 @@ private:
                         if (it != g_websocket_connections.end()) {
                             g_websocket_connections.erase(it);
                             std::cout << "WebSocket client disconnected. Total: " << g_websocket_connections.size() << "\n";
-                            // std::cout << "WebSocket connection closed: " << fd << "\n";
                         }
                     }
                     close(fd);
