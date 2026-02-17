@@ -4,7 +4,12 @@
 # --------------------------------------------------------- #
 
 function _build_backend_cc() {
-	g++ -o ./backend_cc.o ./backend_cc/main.cc -std=c++23 -O3 -pthread -Wall -Wextra;
+    g++ -o ./backend_cc.o ./backend_cc/main.cc \
+        -std=c++23 \
+        -O3 \
+        -flto \
+        -pthread \
+        -march=native;
 }
 
 function _build_backend_cc_drogon() {
@@ -21,8 +26,13 @@ function _build_backend_cc_drogon() {
 # --------------------------------------------------------- #
 # --------------------------------------------------------- #
 
-function _build_backend_rust() {
-    rustc ./backend_rust/src/main.rs -o ./backend_rust.o -C opt-level=3;
+function _build_backend_rs() {
+    rustc ./backend_rs/src/main.rs -o ./backend_rs.o \
+      -C opt-level=3 \
+      -C lto=true \
+      -C codegen-units=1 \
+      -C panic=abort \
+      -C target-cpu=native;
 }
 
 # --------------------------------------------------------- #
@@ -32,10 +42,6 @@ function _build_backend_go() {
 	go build -o ./backend_go.o ./backend_go;
 }
 
-function _build_backend_go_fiber() {
-	go build -o ./backend_go_fiber.o ./backend_go_fiber;
-}
-
 # --------------------------------------------------------- #
 # --------------------------------------------------------- #
 
@@ -43,6 +49,5 @@ function _build_backend_all() {
     _build_backend_cc;
     _build_backend_cc_drogon;
     _build_backend_go;
-    _build_backend_go_fiber;
-    _build_backend_rust;
+    _build_backend_rs;
 }

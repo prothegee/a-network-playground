@@ -1,7 +1,6 @@
 [workspace]
 members = [
-	"backend_rust",
-	"backend_rust_ohkami"
+	"backend_rs",
 ]
 resolver = "2"
 
