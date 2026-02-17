@@ -524,7 +524,8 @@ private:
                                           g_websocket_connections.end(), fd);
                         if (it != g_websocket_connections.end()) {
                             g_websocket_connections.erase(it);
-                            std::cout << "WebSocket connection closed: " << fd << "\n";
+                            std::cout << "WebSocket client disconnected. Total: " << g_websocket_connections.size() << "\n";
+                            // std::cout << "WebSocket connection closed: " << fd << "\n";
                         }
                     }
                     close(fd);
@@ -538,7 +539,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(g_connections_mutex);
             g_websocket_connections.push_back(client_fd);
-            std::cout << "WebSocket connection established: " << client_fd << "\n";
+            std::cout << "WebSocket client connection. Total: " << g_websocket_connections.size() << "\n";
+            // std::cout << "WebSocket connection established: " << client_fd << "\n";
         }
         
         char buffer[CLIENT_REQUEST_BUFFER_SIZE];
