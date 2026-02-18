@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,8 +25,9 @@ TODO:
 
 // --------------------------------------------------------- //
 
-// Global WebSocket connections (like Drogon's g_connections)
-type WebSocketPeers = Arc<Mutex<Vec<std::net::TcpStream>>>;
+// Global WebSocket connections per room (like Drogon's g_connections)
+type RoomName = String;
+type WebSocketPeers = Arc<Mutex<HashMap<RoomName, Vec<std::net::TcpStream>>>>;
 
 // --------------------------------------------------------- //
 
@@ -444,10 +445,11 @@ fn find_header_value<'a>(buffer: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-fn handle_websocket_client(mut stream: std::net::TcpStream, peers: WebSocketPeers) {
+fn handle_websocket_client(mut stream: std::net::TcpStream, room_name: String, peers: WebSocketPeers) {
     struct SocketCloser {
         stream: Option<std::net::TcpStream>,
         peer_addr: std::net::SocketAddr,
+        room_name: String,
         peers: WebSocketPeers,
     }
 
@@ -455,11 +457,18 @@ fn handle_websocket_client(mut stream: std::net::TcpStream, peers: WebSocketPeer
         fn drop(&mut self) {
             // E.Q.: drogon ws handleConnectionClosed
             if self.stream.is_some() {
-                let mut p = self.peers.lock().unwrap();
-                p.retain(|peer| {
-                    peer.peer_addr().map(|a| a != self.peer_addr).unwrap_or(false)
-                });
-                println!("WebSocket client disconnected. Total: {}", p.len());
+                let mut rooms = self.peers.lock().unwrap();
+                if let Some(room_peers) = rooms.get_mut(&self.room_name) {
+                    room_peers.retain(|peer| {
+                        peer.peer_addr().map(|a| a != self.peer_addr).unwrap_or(false)
+                    });
+                    
+                    // Remove room if empty
+                    if room_peers.is_empty() {
+                        rooms.remove(&self.room_name);
+                    }
+                }
+                println!("WebSocket client disconnected from room '{}'.", self.room_name);
             }
         }
     }
@@ -468,14 +477,16 @@ fn handle_websocket_client(mut stream: std::net::TcpStream, peers: WebSocketPeer
     let closer = SocketCloser {
         stream: Some(stream.try_clone().unwrap()),
         peer_addr,
+        room_name: room_name.clone(),
         peers: peers.clone(),
     };
 
     {
-        let mut p = peers.lock().unwrap();
+        let mut rooms = peers.lock().unwrap();
+        let room_peers = rooms.entry(room_name.clone()).or_insert_with(Vec::new);
         if let Ok(clone) = closer.stream.as_ref().unwrap().try_clone() {
-            p.push(clone);
-            println!("WebSocket client connected. Total: {}", p.len());
+            room_peers.push(clone);
+            println!("WebSocket client connected to room '{}'. Total in room: {}", room_name, room_peers.len());
         }
     }
 
@@ -496,11 +507,14 @@ fn handle_websocket_client(mut stream: std::net::TcpStream, peers: WebSocketPeer
 
                             match frame.opcode {
                                 Opcode::Text | Opcode::Binary => {
+                                    // Broadcast to all clients in the same room
                                     let resp_data = frame.serialize();
-                                    let mut p = peers.lock().unwrap();
-                                    for peer in p.iter_mut() {
-                                        let _ = peer.write_all(&resp_data);
-                                        let _ = peer.flush();
+                                    let rooms = peers.lock().unwrap();
+                                    if let Some(room_peers) = rooms.get(&room_name) {
+                                        for mut peer in room_peers.iter() {
+                                            let _ = peer.write_all(&resp_data);
+                                            let _ = peer.flush();
+                                        }
                                     }
                                 }
                                 Opcode::Ping => {
@@ -573,6 +587,18 @@ fn find_headers_end(buffer: &[u8]) -> Option<usize> {
     None
 }
 
+// Helper function to join path segments with "/"
+fn join_path_segments(segments: &[&[u8]]) -> String {
+    let mut result = String::new();
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        result.push_str(&String::from_utf8_lossy(segment));
+    }
+    result
+}
+
 // Optimized client handler with keep-alive support (like C++ version)
 fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
     // Set TCP_NODELAY to disable Nagle's algorithm (like C++ setsockopt TCP_NODELAY)
@@ -643,7 +669,76 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                     if stream.write_all(HOME_RESPONSE).is_err() {
                         return;
                     }
-                } else if path == b"/chat" {
+                } else if path == b"/rs/json" {
+                    // JSON response for /rs/json (specific path, not dynamic)
+                    const JSON_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
+                                                 Content-Type: application/json\r\n\
+                                                 Content-Length: 60\r\n\
+                                                 Connection: keep-alive\r\n\
+                                                 \r\n\
+                                                 {\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}";
+                    if stream.write_all(JSON_RESPONSE).is_err() {
+                        return;
+                    }
+                } else if path.starts_with(b"/rs/") && !path.starts_with(b"/rs/json/") && path != b"/rs/json" {
+                    // Dynamic path for /rs/* (except /rs/json and /rs/json/*)
+                    // Parse path segments after /rs/
+                    let mut segments: Vec<&[u8]> = Vec::new();
+                    let mut start = 4; // after "/rs/"
+                    
+                    while start < path.len() {
+                        if let Some(end) = path[start..].iter().position(|&b| b == b'/') {
+                            if start < start + end {
+                                segments.push(&path[start..start + end]);
+                            }
+                            start += end + 1;
+                        } else {
+                            if start < path.len() {
+                                segments.push(&path[start..]);
+                            }
+                            break;
+                        }
+                    }
+
+                    // Create response body based on path segments
+                    let path_string = join_path_segments(&segments);
+                    let body = if segments.is_empty() {
+                        "value path: /rs/".to_string()
+                    } else {
+                        format!("value path: /rs/{}", path_string)
+                    };
+
+                    // Build HTTP response
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: keep-alive\r\n\
+                         \r\n\
+                         {}",
+                        body.len(),
+                        body
+                    );
+
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                } else if path.starts_with(b"/chat/") {
+                    // WebSocket dengan room name dari path
+                    // Parse room name from path after /chat/
+                    let room_name_bytes = &path[6..]; // after "/chat/"
+                    
+                    // Validate room name (simple validation)
+                    if room_name_bytes.is_empty() {
+                        const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
+                                                    Content-Length: 15\r\n\
+                                                    Connection: close\r\n\
+                                                    \r\n\
+                                                    Room name empty";
+                        let _ = stream.write_all(BAD_REQUEST);
+                        return;
+                    }
+
                     // Check for WebSocket upgrade
                     if let Some(key) = find_header_value(&buffer[processed..used], b"Sec-WebSocket-Key:") {
                         if let Some(upgrade) = find_header_value(&buffer[processed..used], b"Upgrade:") {
@@ -651,8 +746,10 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                 if let Ok(key_str) = std::str::from_utf8(key) {
                                     let response = websocket_handshake(key_str);
                                     if stream.write_all(response.as_bytes()).is_ok() {
-                                        // Switch to WebSocket mode (takes over this stream)
-                                        handle_websocket_client(stream, peers);
+                                        // Convert room name to String
+                                        let room_name = String::from_utf8_lossy(room_name_bytes).to_string();
+                                        // Switch to WebSocket mode with room name
+                                        handle_websocket_client(stream, room_name, peers);
                                         return;
                                     }
                                 }
@@ -725,11 +822,13 @@ fn main() {
     let _ = listener.set_ttl(64);
     
     let pool = ThreadPool::new(CONNECTION_CONCURRENT_TARGET);
-    let peers: WebSocketPeers = Arc::new(Mutex::new(Vec::new()));
+    let peers: WebSocketPeers = Arc::new(Mutex::new(HashMap::new()));
     
     println!("backend_rs: run on {}:{}", ADDRESS_IP, ADDRESS_PORT);
     println!("  - HTTP endpoint: /rs");
-    println!("  - WebSocket endpoint: /chat");
+    println!("  - JSON endpoint: /rs/json");
+    println!("  - Dynamic path: /rs/{{path1}}/{{path2}}/... (except /rs/json)");
+    println!("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)");
 
     for stream in listener.incoming() {
         match stream {
