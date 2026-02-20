@@ -38,6 +38,13 @@ function _build_backend_rs() {
 # --------------------------------------------------------- #
 # --------------------------------------------------------- #
 
+function _build_backend_zig() {
+    zig build-exe backend_zig/main.zig --name backend_zig.o;
+}
+
+# --------------------------------------------------------- #
+# --------------------------------------------------------- #
+
 function _build_backend_go() {
 	go build -o ./backend_go.o ./backend_go;
 }
@@ -48,6 +55,7 @@ function _build_backend_go() {
 function _build_backend_all() {
     _build_backend_cc;
     _build_backend_cc_drogon;
-    _build_backend_go;
     _build_backend_rs;
+    _build_backend_zig;
+    _build_backend_go;
 }
