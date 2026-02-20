@@ -15,6 +15,7 @@
 #include <atomic>
 #include <vector>
 #include <queue>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
@@ -23,6 +24,7 @@
 #include <string_view>
 #include <algorithm>
 #include <array>
+#include <sstream>
 
 #define ADDRESS_IP "0.0.0.0"
 #define ADDRESS_PORT 9002
@@ -45,9 +47,13 @@ TODO:
 
 // --------------------------------------------------------- //
 
-// Global WebSocket connections (like Drogon's g_connections)
-static std::vector<int> g_websocket_connections;
-static std::mutex g_connections_mutex;
+// Global WebSocket connections per room (like Rust's WebSocketPeers)
+using RoomName = std::string;
+struct WebSocketRoom {
+    std::vector<int> connections;
+};
+static std::map<RoomName, WebSocketRoom> g_websocket_rooms;
+static std::mutex g_rooms_mutex;
 
 // --------------------------------------------------------- //
 class SignalHandler {
@@ -248,9 +254,11 @@ public:
     }
 
     // Create pong frame
-    static WebSocketFrame create_pong_frame() {
+    static WebSocketFrame create_pong_frame(const std::vector<uint8_t>& payload = {}) {
         WebSocketFrame frame;
         frame.opcode = PONG;
+        frame.payload = payload;
+        frame.payload_length = payload.size();
         return frame;
     }
 
@@ -446,6 +454,16 @@ private:
         "Connection: keep-alive\r\n"
         "\r\n"
         "home";
+    
+    // JSON response for /cc/json endpoint
+    const std::string json_response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 60\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        "{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}";
+    
     const std::string not_found_response =
         "HTTP/1.1 404 Not Found\r\n"
         "Content-Type: text/plain\r\n"
@@ -453,6 +471,7 @@ private:
         "Connection: keep-alive\r\n"
         "\r\n"
         "Not Found";
+    
     const std::string method_not_allowed_response =
         "HTTP/1.1 405 Method Not Allowed\r\n"
         "Content-Type: text/plain\r\n"
@@ -460,6 +479,7 @@ private:
         "Connection: keep-alive\r\n"
         "\r\n"
         "Method Not Allowed";
+    
     const std::string bad_request_response =
         "HTTP/1.1 400 Bad Request\r\n"
         "Content-Type: text/plain\r\n"
@@ -484,6 +504,40 @@ private:
         return (len == 0);
     }
 
+    // Helper function to join path segments
+    std::string join_path_segments(const std::vector<std::string>& segments) {
+        std::string result;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (i > 0) {
+                result += "/";
+            }
+            result += segments[i];
+        }
+        return result;
+    }
+
+    // Parse path segments for dynamic routing
+    std::vector<std::string> parse_path_segments(std::string_view path) {
+        std::vector<std::string> segments;
+        size_t start = 4; // after "/cc/"
+        
+        while (start < path.length()) {
+            size_t end = path.find('/', start);
+            if (end == std::string_view::npos) {
+                if (start < path.length()) {
+                    segments.push_back(std::string(path.substr(start)));
+                }
+                break;
+            } else {
+                if (start < end) {
+                    segments.push_back(std::string(path.substr(start, end - start)));
+                }
+                start = end + 1;
+            }
+        }
+        return segments;
+    }
+
     // WebSocket handshake response
     std::string websocket_handshake_response(const std::string& sec_websocket_key) {
         std::string accept_key = sec_websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -496,22 +550,34 @@ private:
             "\r\n";
     }
 
-    // Handle WebSocket connection
-    void handle_websocket(int client_fd) {
+    // Handle WebSocket connection with room name
+    void handle_websocket(int client_fd, const std::string& room_name) {
         struct SocketCloser {
             int fd;
-            explicit SocketCloser(int fd_) : fd(fd_) {}
-            // E.Q.: drogon ws handleConnectionClosed
+            std::string room;
+            explicit SocketCloser(int fd_, const std::string& room_) : fd(fd_), room(room_) {}
+            // E.Q.: drogon ws handleConnectionClosed (room-based)
             ~SocketCloser() {
                 if (fd != -1) {
-                    // Remove from global connections
+                    // Remove from room connections
                     {
-                        std::lock_guard<std::mutex> lock(g_connections_mutex);
-                        auto it = std::find(g_websocket_connections.begin(),
-                            g_websocket_connections.end(), fd);
-                        if (it != g_websocket_connections.end()) {
-                            g_websocket_connections.erase(it);
-                            std::cout << "WebSocket client disconnected. Total: " << g_websocket_connections.size() << "\n";
+                        std::lock_guard<std::mutex> lock(g_rooms_mutex);
+                        auto room_it = g_websocket_rooms.find(room);
+                        if (room_it != g_websocket_rooms.end()) {
+                            auto& connections = room_it->second.connections;
+                            connections.erase(
+                                std::remove(connections.begin(), connections.end(), fd),
+                                connections.end()
+                            );
+                            
+                            // Remove room if empty
+                            if (connections.empty()) {
+                                g_websocket_rooms.erase(room_it);
+                                std::cout << "Room '" << room << "' removed (empty).\n";
+                            } else {
+                                std::cout << "WebSocket client disconnected from room '" << room << "'. Total in room: " 
+                                          << connections.size() << "\n";
+                            }
                         }
                     }
                     close(fd);
@@ -520,13 +586,15 @@ private:
 
             SocketCloser(const SocketCloser&) = delete;
             SocketCloser& operator=(const SocketCloser&) = delete;
-        } closer(client_fd);
+        } closer(client_fd, room_name);
 
-        // Register connection (E.Q.: drogon ws handleNewConnection)
+        // Register connection to room (E.Q.: drogon ws handleNewConnection with room)
         {
-            std::lock_guard<std::mutex> lock(g_connections_mutex);
-            g_websocket_connections.push_back(client_fd);
-            std::cout << "WebSocket client connection. Total: " << g_websocket_connections.size() << "\n";
+            std::lock_guard<std::mutex> lock(g_rooms_mutex);
+            auto& room = g_websocket_rooms[room_name];
+            room.connections.push_back(client_fd);
+            std::cout << "WebSocket client connected to room '" << room_name << "'. Total in room: " 
+                      << room.connections.size() << "\n";
         }
 
         char buffer[CLIENT_REQUEST_BUFFER_SIZE];
@@ -569,18 +637,21 @@ private:
                 // Handle different opcodes
                 switch (frame.opcode) {
                 case WebSocketFrame::TEXT:
-
                 case WebSocketFrame::BINARY: {
-                    // Broadcast to all connections (E.Q.: drogon ws handleNewMessage)
+                    // Broadcast to all connections in the same room (like Rust version)
                     {
-                        std::lock_guard<std::mutex> lock(g_connections_mutex);
-                        for (int conn_fd : g_websocket_connections) {
+                        std::lock_guard<std::mutex> lock(g_rooms_mutex);
+                        auto room_it = g_websocket_rooms.find(room_name);
+                        if (room_it != g_websocket_rooms.end()) {
                             WebSocketFrame broadcast_frame;
                             broadcast_frame.opcode = frame.opcode;
                             broadcast_frame.payload = frame.payload;
                             broadcast_frame.payload_length = frame.payload_length;
                             auto response = broadcast_frame.serialize();
-                            send_all(conn_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                            
+                            for (int conn_fd : room_it->second.connections) {
+                                send_all(conn_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                            }
                         }
                     }
                     break;
@@ -588,11 +659,7 @@ private:
 
                 case WebSocketFrame::PING: {
                     // Respond with PONG
-                    WebSocketFrame pong_frame = WebSocketFrame::create_pong_frame();
-                    if (!frame.payload.empty()) {
-                        pong_frame.payload = frame.payload;
-                        pong_frame.payload_length = frame.payload_length;
-                    }
+                    WebSocketFrame pong_frame = WebSocketFrame::create_pong_frame(frame.payload);
                     auto response = pong_frame.serialize();
                     send_all(client_fd, reinterpret_cast<const char*>(response.data()), response.size());
                     break;
@@ -673,7 +740,9 @@ public:
 
         std::cout << "backend_cc: run on " << ADDRESS_IP << ":" << ADDRESS_PORT << "\n";
         std::cout << "  - HTTP endpoint: /cc\n";
-        std::cout << "  - WebSocket endpoint: /chat\n";
+        std::cout << "  - JSON endpoint: /cc/json\n";
+        std::cout << "  - Dynamic path: /cc/{path1}/{path2}/... (except /cc/json)\n";
+        std::cout << "  - WebSocket endpoint: /chat/{room_name} (per room broadcast)\n";
 
         while (running.load(std::memory_order_acquire)) {
             sockaddr_in client_addr{};
@@ -709,12 +778,14 @@ public:
         if (!running.exchange(false, std::memory_order_release)) return;
         // Close all WebSocket connections
         {
-            std::lock_guard<std::mutex> lock(g_connections_mutex);
-            for (int fd : g_websocket_connections) {
-                shutdown(fd, SHUT_RDWR);
-                close(fd);
+            std::lock_guard<std::mutex> lock(g_rooms_mutex);
+            for (auto& [room_name, room] : g_websocket_rooms) {
+                for (int fd : room.connections) {
+                    shutdown(fd, SHUT_RDWR);
+                    close(fd);
+                }
             }
-            g_websocket_connections.clear();
+            g_websocket_rooms.clear();
         }
 
         if (server_fd != -1) {
@@ -814,8 +885,17 @@ private:
                 path = path.substr(0, query_pos);
             }
 
-            // WebSocket handshake check
-            if (method == "GET" && path == "/chat") {
+            // Check for WebSocket upgrade with room name (like Rust's /chat/{room_name})
+            if (method == "GET" && path.substr(0, 6) == "/chat/" && path.length() > 6) {
+                // Extract room name from path after /chat/
+                std::string room_name = std::string(path.substr(6));
+                
+                // Validate room name (simple validation)
+                if (room_name.empty()) {
+                    send_all(client_fd, bad_request_response.data(), bad_request_response.size());
+                    return;
+                }
+                
                 // Extract headers to check for WebSocket upgrade
                 std::string headers(full_buffer.data(), end_of_headers + 2);
                 std::string upgrade = extract_header_value(headers, "Upgrade:");
@@ -834,17 +914,17 @@ private:
                         // Perform WebSocket handshake
                         std::string handshake_response = websocket_handshake_response(sec_websocket_key);
                         send_all(client_fd, handshake_response.c_str(), handshake_response.length());
-                        // Switch to WebSocket mode
-                        // E.Q.: drogon ws handleNewConnection
-                        handle_websocket(client_fd);
+                        // Switch to WebSocket mode with room name
+                        handle_websocket(client_fd, room_name);
                         return;
                     }
                 }
-                // Not a WebSocket request, fall through to normal HTTP
+                // Not a WebSocket request, fall through to normal HTTP (will return 404)
             }
 
             const char* response = nullptr;
             size_t response_len = 0;
+            std::string dynamic_response; // For dynamic path responses
 
             if (method != "GET") {
                 response = method_not_allowed_response.data();
@@ -852,8 +932,37 @@ private:
             } else if (path == "/cc") {
                 response = home_response.data();
                 response_len = home_response.size();
-            } else if (path == "/chat") {
-                // WebSocket endpoint accessed via regular HTTP
+            } else if (path == "/cc/json") {
+                // JSON endpoint (like Rust's /rs/json)
+                response = json_response.data();
+                response_len = json_response.size();
+            } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" && 
+                       path.substr(0, 9) != "/cc/json/") {
+                // Dynamic path for /cc/* (except /cc/json and /cc/json/*) - like Rust's /rs/*
+                auto segments = parse_path_segments(path);
+                
+                // Create response body based on path segments
+                std::string path_string = join_path_segments(segments);
+                std::string body;
+                if (segments.empty()) {
+                    body = "value path: /cc/";
+                } else {
+                    body = "value path: /cc/" + path_string;
+                }
+                
+                // Build HTTP response
+                std::ostringstream oss;
+                oss << "HTTP/1.1 200 OK\r\n"
+                    << "Content-Type: text/plain\r\n"
+                    << "Content-Length: " << body.length() << "\r\n"
+                    << "Connection: keep-alive\r\n"
+                    << "\r\n"
+                    << body;
+                dynamic_response = oss.str();
+                response = dynamic_response.c_str();
+                response_len = dynamic_response.length();
+            } else if (path.substr(0, 6) == "/chat/") {
+                // WebSocket endpoint accessed via regular HTTP (no upgrade)
                 response = not_found_response.data();
                 response_len = not_found_response.size();
             } else {
