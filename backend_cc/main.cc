@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <sstream>
+#include <cctype>
 
 #define ADDRESS_IP "0.0.0.0"
 #define ADDRESS_PORT 9002
@@ -41,13 +42,14 @@ TODO:
 [X] blocking I/O (not epoll)
 [X] keep-alive (manual)
 [X] websocket support
+[X] query parameters parsing
 [?] not full http spec
 [?] not async / non-blocking server
 */
 
 // --------------------------------------------------------- //
 
-// Global WebSocket connections per room (like Rust's WebSocketPeers)
+// Global WebSocket connections per room (like Drogon's g_connections)
 using RoomName = std::string;
 struct WebSocketRoom {
     std::vector<int> connections;
@@ -149,7 +151,7 @@ public:
 
     WebSocketFrame() : fin(true), mask(false), opcode(TEXT), payload_length(0) {}
 
-    // Parse WebSocket frame from buffer
+    // Parse WebSocket frame from buffer (RFC 6455)
     static bool parse(const uint8_t* data, size_t len, WebSocketFrame& frame, size_t& consumed) {
         if (len < 2) return false;
         const uint8_t* ptr = data;
@@ -194,7 +196,6 @@ public:
         if (len < total_frame_size) return false;
 
         frame.payload.resize(frame.payload_length);
-
         if (frame.payload_length > 0) {
             std::copy(ptr, ptr + frame.payload_length, frame.payload.begin());
             // Unmask payload if masked
@@ -209,16 +210,12 @@ public:
         return true;
     }
 
-    // Serialize WebSocket frame to buffer
+    // Serialize WebSocket frame to buffer (no mask for server->client)
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> buffer;
-
-        // First byte: FIN + Opcode
         uint8_t first_byte = (fin ? 0x80 : 0x00) | static_cast<uint8_t>(opcode);
-
         buffer.push_back(first_byte);
 
-        // Second byte and extended length: Payload length (no mask for server->client)
         if (payload_length <= 125) {
             buffer.push_back(static_cast<uint8_t>(payload_length));
         } else if (payload_length <= 65535) {
@@ -232,12 +229,10 @@ public:
             }
         }
 
-        // Payload
         buffer.insert(buffer.end(), payload.begin(), payload.end());
         return buffer;
     }
 
-    // Create text frame
     static WebSocketFrame create_text_frame(const std::string& text) {
         WebSocketFrame frame;
         frame.opcode = TEXT;
@@ -246,14 +241,6 @@ public:
         return frame;
     }
 
-    // Create ping frame
-    static WebSocketFrame create_ping_frame() {
-        WebSocketFrame frame;
-        frame.opcode = PING;
-        return frame;
-    }
-
-    // Create pong frame
     static WebSocketFrame create_pong_frame(const std::vector<uint8_t>& payload = {}) {
         WebSocketFrame frame;
         frame.opcode = PONG;
@@ -262,7 +249,6 @@ public:
         return frame;
     }
 
-    // Create close frame
     static WebSocketFrame create_close_frame(uint16_t code = 1000, const std::string& reason = "") {
         WebSocketFrame frame;
         frame.opcode = CLOSE;
@@ -287,7 +273,6 @@ public:
         static const char* encoding_table =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         size_t data_len = data.length();
-
         size_t output_len = 4 * ((data_len + 2) / 3);
         std::string output(output_len, ' ');
         size_t i = 0, j = 0;
@@ -303,10 +288,8 @@ public:
             output[j++] = encoding_table[triple & 0x3F];
         }
 
-        // Handle padding
         size_t mod_table[] = {0, 2, 1};
         size_t padding = mod_table[data_len % 3];
-
         for (size_t i = 0; i < padding; i++) {
             output[output_len - 1 - i] = '=';
         }
@@ -396,18 +379,14 @@ public:
     void finalize(uint8_t* digest) {
         uint8_t padding[64];
         size_t padding_len = 64 - (count % 64);
-
         if (padding_len < 9) padding_len += 64;
 
         padding[0] = 0x80;
-
         for (size_t i = 1; i < padding_len - 8; i++) {
             padding[i] = 0;
         }
 
-        // Append bit length (in bits)
         uint64_t bitlen = count * 8;
-
         for (size_t i = 0; i < 8; i++) {
             padding[padding_len - 8 + i] = (bitlen >> (56 - i * 8)) & 0xFF;
         }
@@ -424,19 +403,74 @@ public:
 
     static std::string hash(const std::string& input) {
         SHA1 sha1;
-
         sha1.update(reinterpret_cast<const uint8_t*>(input.data()), input.length());
         uint8_t digest[20];
-
         sha1.finalize(digest);
-        std::string result;
-
-        result.reserve(20);
-        result.assign(reinterpret_cast<char*>(digest), 20);
-
-        return result;
+        return std::string(reinterpret_cast<char*>(digest), 20);
     }
 };
+
+// --------------------------------------------------------- //
+
+// Fast query parameter parsing
+struct QueryParam {
+    std::string key;
+    std::string value;
+};
+
+std::string percent_decode(std::string_view input) {
+    std::string result;
+    result.reserve(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && i + 2 < input.size()) {
+            int hex_val;
+            std::istringstream iss(std::string(input.substr(i+1, 2)));
+            if (iss >> std::hex >> hex_val) {
+                result.push_back(static_cast<char>(hex_val));
+                i += 2;
+            } else {
+                result.push_back('%');
+            }
+        } else if (input[i] == '+') {
+            result.push_back(' ');
+        } else {
+            result.push_back(input[i]);
+        }
+    }
+    return result;
+}
+
+std::vector<QueryParam> parse_query_params(std::string_view query) {
+    std::vector<QueryParam> params;
+    if (query.empty()) return params;
+
+    size_t pos = 0;
+    while (pos < query.size()) {
+        size_t amp_pos = query.find('&', pos);
+        if (amp_pos == std::string_view::npos) amp_pos = query.size();
+
+        std::string_view pair = query.substr(pos, amp_pos - pos);
+        size_t eq_pos = pair.find('=');
+        if (eq_pos != std::string_view::npos) {
+            std::string_view key = pair.substr(0, eq_pos);
+            std::string_view val = pair.substr(eq_pos + 1);
+            params.push_back({percent_decode(key), percent_decode(val)});
+        } else {
+            params.push_back({percent_decode(pair), ""});
+        }
+
+        pos = amp_pos + 1;
+    }
+    return params;
+}
+
+std::pair<std::string_view, std::string_view> split_path_query(std::string_view full_path) {
+    size_t qpos = full_path.find('?');
+    if (qpos == std::string_view::npos) {
+        return {full_path, {}};
+    }
+    return {full_path.substr(0, qpos), full_path.substr(qpos + 1)};
+}
 
 // --------------------------------------------------------- //
 
@@ -455,7 +489,6 @@ private:
         "\r\n"
         "home";
     
-    // JSON response for /cc/json endpoint
     const std::string json_response =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/json\r\n"
@@ -492,53 +525,42 @@ private:
         while (len > 0) {
             ssize_t written = write(fd, data, len);
             if (written <= 0) {
-                if (written == -1) {
-                    if (errno == EINTR) continue;
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
-                }
+                if (written == -1 && (errno == EINTR || errno == EAGAIN)) continue;
                 return false;
             }
             data += written;
             len -= written;
         }
-        return (len == 0);
+        return true;
     }
 
-    // Helper function to join path segments
     std::string join_path_segments(const std::vector<std::string>& segments) {
         std::string result;
         for (size_t i = 0; i < segments.size(); ++i) {
-            if (i > 0) {
-                result += "/";
-            }
+            if (i > 0) result += "/";
             result += segments[i];
         }
         return result;
     }
 
-    // Parse path segments for dynamic routing
     std::vector<std::string> parse_path_segments(std::string_view path) {
         std::vector<std::string> segments;
         size_t start = 4; // after "/cc/"
-        
         while (start < path.length()) {
             size_t end = path.find('/', start);
             if (end == std::string_view::npos) {
-                if (start < path.length()) {
+                if (start < path.length())
                     segments.push_back(std::string(path.substr(start)));
-                }
                 break;
             } else {
-                if (start < end) {
+                if (start < end)
                     segments.push_back(std::string(path.substr(start, end - start)));
-                }
                 start = end + 1;
             }
         }
         return segments;
     }
 
-    // WebSocket handshake response
     std::string websocket_handshake_response(const std::string& sec_websocket_key) {
         std::string accept_key = sec_websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         std::string sha1_hash = SHA1::hash(accept_key);
@@ -550,13 +572,13 @@ private:
             "\r\n";
     }
 
-    // Handle WebSocket connection with room name
+    // Handle WebSocket connection with room name (like Drogon's websocket controller)
     void handle_websocket(int client_fd, const std::string& room_name) {
         struct SocketCloser {
             int fd;
             std::string room;
             explicit SocketCloser(int fd_, const std::string& room_) : fd(fd_), room(room_) {}
-            // E.Q.: drogon ws handleConnectionClosed (room-based)
+            // E.Q.: drogon ws handleConnectionClosed
             ~SocketCloser() {
                 if (fd != -1) {
                     // Remove from room connections
@@ -565,18 +587,23 @@ private:
                         auto room_it = g_websocket_rooms.find(room);
                         if (room_it != g_websocket_rooms.end()) {
                             auto& connections = room_it->second.connections;
+                            auto before_count = connections.size();
                             connections.erase(
                                 std::remove(connections.begin(), connections.end(), fd),
                                 connections.end()
                             );
+                            auto after_count = connections.size();
                             
-                            // Remove room if empty
+                            // Log disconnect with remaining count
+                            if (before_count > after_count) {
+                                std::cout << "WebSocket client disconnected from room '" << room << "'. Total in room: " 
+                                          << after_count << "\n";
+                            }
+                            
+                            // Remove room if empty and log
                             if (connections.empty()) {
                                 g_websocket_rooms.erase(room_it);
                                 std::cout << "Room '" << room << "' removed (empty).\n";
-                            } else {
-                                std::cout << "WebSocket client disconnected from room '" << room << "'. Total in room: " 
-                                          << connections.size() << "\n";
                             }
                         }
                     }
@@ -588,7 +615,7 @@ private:
             SocketCloser& operator=(const SocketCloser&) = delete;
         } closer(client_fd, room_name);
 
-        // Register connection to room (E.Q.: drogon ws handleNewConnection with room)
+        // E.Q.: drogon ws handleNewConnection
         {
             std::lock_guard<std::mutex> lock(g_rooms_mutex);
             auto& room = g_websocket_rooms[room_name];
@@ -605,10 +632,7 @@ private:
             if (buffer_used < sizeof(buffer) - 1) {
                 ssize_t bytes_read = read(client_fd, buffer + buffer_used, sizeof(buffer) - 1 - buffer_used);
                 if (bytes_read <= 0) {
-                    if (bytes_read == -1) {
-                        if (errno == EINTR) continue;
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-                    }
+                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN)) continue;
                     return;
                 }
                 buffer_used += bytes_read;
@@ -638,7 +662,7 @@ private:
                 switch (frame.opcode) {
                 case WebSocketFrame::TEXT:
                 case WebSocketFrame::BINARY: {
-                    // Broadcast to all connections in the same room (like Rust version)
+                    // E.Q.: drogon ws handleNewMessage - broadcast to all connections in the same room
                     {
                         std::lock_guard<std::mutex> lock(g_rooms_mutex);
                         auto room_it = g_websocket_rooms.find(room_name);
@@ -678,7 +702,8 @@ private:
                     return;
                 }
 
-                case WebSocketFrame::CONTINUATION: {
+                case WebSocketFrame::CONTINUATION:
+                default: {
                     // Not handling fragmented messages for simplicity
                     WebSocketFrame close_frame = WebSocketFrame::create_close_frame(1003, "Fragmentation not supported");
                     auto response = close_frame.serialize();
@@ -700,29 +725,21 @@ private:
 
 public:
     HttpServer(int port_num, size_t concurrency_target = 128)
-        : port(port_num),
-        running(true),
-        thread_pool(std::max(
-            std::min(concurrency_target, size_t(CONNECTION_CONCURRENT_TARGET)),
-            size_t(std::thread::hardware_concurrency())
-        )) {
+        : port(port_num), running(true),
+          thread_pool(std::max(std::min(concurrency_target, size_t(CONNECTION_CONCURRENT_TARGET)),
+                               size_t(std::thread::hardware_concurrency()))) {
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
-
         if (server_fd == -1) {
-            throw std::runtime_error("Failed to create socket: " + std::string(strerror(errno)));
+            throw std::runtime_error("socket failed");
         }
-
         int opt = 1;
-
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
             close(server_fd);
-            throw std::runtime_error("Failed to set SO_REUSEADDR: " + std::string(strerror(errno)));
+            throw std::runtime_error("setsockopt failed");
         }
     }
 
-    ~HttpServer() {
-        stop();
-    }
+    ~HttpServer() { stop(); }
 
     void start() {
         sockaddr_in address{};
@@ -731,55 +748,42 @@ public:
         address.sin_port = htons(port);
 
         if (bind(server_fd, (sockaddr*)&address, sizeof(address)) == -1) {
-            throw std::runtime_error("Failed to bind socket: " + std::string(strerror(errno)));
+            throw std::runtime_error("bind failed");
         }
-
         if (listen(server_fd, 1024) == -1) {
-            throw std::runtime_error("Failed to listen on socket: " + std::string(strerror(errno)));
+            throw std::runtime_error("listen failed");
         }
 
         std::cout << "backend_cc: run on " << ADDRESS_IP << ":" << ADDRESS_PORT << "\n";
         std::cout << "  - HTTP endpoint: /cc\n";
         std::cout << "  - JSON endpoint: /cc/json\n";
+        std::cout << "  - Echo endpoint: /cc/echo?text=hello (query parameters)\n";
         std::cout << "  - Dynamic path: /cc/{path1}/{path2}/... (except /cc/json)\n";
         std::cout << "  - WebSocket endpoint: /chat/{room_name} (per room broadcast)\n";
 
-        while (running.load(std::memory_order_acquire)) {
+        while (running) {
             sockaddr_in client_addr{};
             socklen_t client_len = sizeof(client_addr);
             int client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_len);
-
             if (client_fd == -1) {
-                if (!running.load(std::memory_order_acquire)) break;
-                if (errno == EINTR) continue;
-                if (errno == ECONNABORTED || errno == EPROTO) continue;
+                if (!running) break;
                 continue;
             }
-
             int flag = 1;
-
             setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
-            try {
-                thread_pool.enqueue([this, client_fd]() {
-                    try {
-                        handle_client(client_fd);
-                    } catch (...) {
-                        close(client_fd);
-                    }
-                });
-            } catch (...) {
-                close(client_fd);
-            }
+            thread_pool.enqueue([this, client_fd]() {
+                try { handle_client(client_fd); }
+                catch (...) { close(client_fd); }
+            });
         }
     }
 
     void stop() {
-        if (!running.exchange(false, std::memory_order_release)) return;
+        if (!running.exchange(false)) return;
         // Close all WebSocket connections
         {
             std::lock_guard<std::mutex> lock(g_rooms_mutex);
-            for (auto& [room_name, room] : g_websocket_rooms) {
+            for (auto& [_, room] : g_websocket_rooms) {
                 for (int fd : room.connections) {
                     shutdown(fd, SHUT_RDWR);
                     close(fd);
@@ -787,7 +791,6 @@ public:
             }
             g_websocket_rooms.clear();
         }
-
         if (server_fd != -1) {
             shutdown(server_fd, SHUT_RDWR);
             close(server_fd);
@@ -796,37 +799,20 @@ public:
     }
 
 private:
-    size_t thread_pool_size() const {
-        return std::thread::hardware_concurrency();
-    }
-
     std::string extract_header_value(const std::string& headers, const std::string& header_name) {
         size_t pos = headers.find(header_name);
-
         if (pos == std::string::npos) return "";
-
         pos += header_name.length();
         size_t end = headers.find("\r\n", pos);
-
         if (end == std::string::npos) return "";
-
         std::string value = headers.substr(pos, end - pos);
-
-        // Trim leading/trailing whitespace and colon
         value.erase(0, value.find_first_not_of(" \t:"));
         value.erase(value.find_last_not_of(" \t") + 1);
-
         return value;
     }
 
     void handle_client(int client_fd) {
-        struct SocketCloser {
-            int fd;
-            explicit SocketCloser(int fd_) : fd(fd_) {}
-            ~SocketCloser() { if (fd != -1) close(fd); }
-            SocketCloser(const SocketCloser&) = delete;
-            SocketCloser& operator=(const SocketCloser&) = delete;
-        } closer(client_fd);
+        struct SocketCloser { int fd; explicit SocketCloser(int fd_) : fd(fd_) {} ~SocketCloser() { if (fd != -1) close(fd); } } closer(client_fd);
 
         char buffer[CLIENT_REQUEST_BUFFER_SIZE];
         size_t buffer_used = 0;
@@ -835,57 +821,42 @@ private:
             if (buffer_used < sizeof(buffer) - 1) {
                 ssize_t bytes_read = read(client_fd, buffer + buffer_used, sizeof(buffer) - 1 - buffer_used);
                 if (bytes_read <= 0) {
-                    if (bytes_read == -1) {
-                        if (errno == EINTR) continue;
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-                    }
+                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN)) continue;
                     return;
                 }
-
                 buffer_used += bytes_read;
                 buffer[buffer_used] = '\0';
             }
 
             std::string_view full_buffer(buffer, buffer_used);
             size_t end_of_headers = full_buffer.find("\r\n\r\n");
-
             if (end_of_headers == std::string_view::npos) {
                 if (buffer_used >= sizeof(buffer) - 1) return;
                 continue;
             }
 
             size_t end_of_line = full_buffer.find("\r\n");
-
-            if (end_of_line == std::string_view::npos || end_of_line > end_of_headers) {
-                return;
-            }
+            if (end_of_line == std::string_view::npos || end_of_line > end_of_headers) return;
 
             std::string_view request_line = full_buffer.substr(0, end_of_line);
             size_t first_space = request_line.find(' ');
-
             if (first_space == std::string_view::npos) {
                 send_all(client_fd, not_found_response.data(), not_found_response.size());
-                buffer_used = 0;
-                continue;
+                buffer_used = 0; continue;
             }
 
             std::string_view method = request_line.substr(0, first_space);
             size_t second_space = request_line.find(' ', first_space + 1);
-
             if (second_space == std::string_view::npos || second_space > end_of_line) {
                 send_all(client_fd, not_found_response.data(), not_found_response.size());
-                buffer_used = 0;
-                continue;
+                buffer_used = 0; continue;
             }
 
-            std::string_view path = request_line.substr(first_space + 1, second_space - first_space - 1);
-            size_t query_pos = path.find('?');
+            std::string_view full_path = request_line.substr(first_space + 1, second_space - first_space - 1);
+            auto [path, query] = split_path_query(full_path);
+            auto query_params = parse_query_params(query);
 
-            if (query_pos != std::string_view::npos) {
-                path = path.substr(0, query_pos);
-            }
-
-            // Check for WebSocket upgrade with room name (like Rust's /chat/{room_name})
+            // WebSocket check with room name (/chat/{room_name})
             if (method == "GET" && path.substr(0, 6) == "/chat/" && path.length() > 6) {
                 // Extract room name from path after /chat/
                 std::string room_name = std::string(path.substr(6));
@@ -904,13 +875,10 @@ private:
 
                 // Check if this is a WebSocket upgrade request
                 if (!upgrade.empty() && !connection.empty() && !sec_websocket_key.empty()) {
-                    bool is_websocket = (upgrade.find("websocket") != std::string::npos ||
-                        upgrade.find("WebSocket") != std::string::npos);
+                    bool is_websocket = (upgrade.find("websocket") != std::string::npos);
+                    bool is_upgrade = (connection.find("Upgrade") != std::string::npos);
 
-                    bool is_upgrade = (connection.find("Upgrade") != std::string::npos ||
-                        connection.find("upgrade") != std::string::npos);
-
-                    if (is_websocket && is_upgrade && !sec_websocket_key.empty()) {
+                    if (is_websocket && is_upgrade) {
                         // Perform WebSocket handshake
                         std::string handshake_response = websocket_handshake_response(sec_websocket_key);
                         send_all(client_fd, handshake_response.c_str(), handshake_response.length());
@@ -924,7 +892,7 @@ private:
 
             const char* response = nullptr;
             size_t response_len = 0;
-            std::string dynamic_response; // For dynamic path responses
+            std::string dynamic_response;
 
             if (method != "GET") {
                 response = method_not_allowed_response.data();
@@ -933,22 +901,45 @@ private:
                 response = home_response.data();
                 response_len = home_response.size();
             } else if (path == "/cc/json") {
-                // JSON endpoint (like Rust's /rs/json)
                 response = json_response.data();
                 response_len = json_response.size();
-            } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" && 
-                       path.substr(0, 9) != "/cc/json/") {
-                // Dynamic path for /cc/* (except /cc/json and /cc/json/*) - like Rust's /rs/*
+            } else if (path == "/cc/echo") {
+                std::string body;
+                bool found_text = false;
+                for (const auto& p : query_params) {
+                    if (p.key == "text") {
+                        body = "Echo: " + p.value;
+                        found_text = true;
+                        break;
+                    }
+                }
+                if (!found_text) {
+                    std::ostringstream oss;
+                    oss << "{";
+                    for (size_t i = 0; i < query_params.size(); ++i) {
+                        if (i > 0) oss << ",";
+                        oss << "\"" << query_params[i].key << "\":\"" << query_params[i].value << "\"";
+                    }
+                    oss << "}";
+                    body = oss.str();
+                }
+                std::ostringstream oss;
+                oss << "HTTP/1.1 200 OK\r\n"
+                    << "Content-Type: application/json\r\n"
+                    << "Content-Length: " << body.length() << "\r\n"
+                    << "Connection: keep-alive\r\n"
+                    << "\r\n"
+                    << body;
+                dynamic_response = oss.str();
+                response = dynamic_response.c_str();
+                response_len = dynamic_response.length();
+            } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" && path.substr(0, 9) != "/cc/json/") {
+                // Dynamic path for /cc/* (except /cc/json and /cc/json/*)
                 auto segments = parse_path_segments(path);
                 
                 // Create response body based on path segments
                 std::string path_string = join_path_segments(segments);
-                std::string body;
-                if (segments.empty()) {
-                    body = "value path: /cc/";
-                } else {
-                    body = "value path: /cc/" + path_string;
-                }
+                std::string body = segments.empty() ? "value path: /cc/" : "value path: /cc/" + path_string;
                 
                 // Build HTTP response
                 std::ostringstream oss;
@@ -961,10 +952,6 @@ private:
                 dynamic_response = oss.str();
                 response = dynamic_response.c_str();
                 response_len = dynamic_response.length();
-            } else if (path.substr(0, 6) == "/chat/") {
-                // WebSocket endpoint accessed via regular HTTP (no upgrade)
-                response = not_found_response.data();
-                response_len = not_found_response.size();
             } else {
                 response = not_found_response.data();
                 response_len = not_found_response.size();
@@ -974,19 +961,16 @@ private:
             iov.iov_base = const_cast<char*>(response);
             iov.iov_len = response_len;
             ssize_t written = writev(client_fd, &iov, 1);
-
             if (written != static_cast<ssize_t>(response_len)) {
-                if (written == -1 && (errno == EINTR || errno == EAGAIN)) {
+                if (written == -1 && (errno == EINTR || errno == EAGAIN))
                     writev(client_fd, &iov, 1);
-                }
                 return;
             }
 
             size_t consumed = end_of_headers + 4;
-
             if (consumed < buffer_used) {
                 memmove(buffer, buffer + consumed, buffer_used - consumed);
-                buffer_used = buffer_used - consumed;
+                buffer_used -= consumed;
             } else {
                 buffer_used = 0;
             }
@@ -997,7 +981,6 @@ private:
 // --------------------------------------------------------- //
 int main() {
     std::signal(SIGPIPE, SIG_IGN);
-
     try {
         HttpServer server(ADDRESS_PORT, CONNECTION_CONCURRENT_TARGET);
         server.start();
@@ -1005,6 +988,19 @@ int main() {
         std::cerr << "server error: " << e.what() << "\n";
         return 1;
     }
-
     return 0;
 }
+
+/*
+IMPORTANT:
+this implementation result:
+➜ wrk -c 100 -t 6 -d 10s http://localhost:9002/cc
+Running 10s test @ http://localhost:9002/cc
+  6 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   262.75us  527.58us   5.56ms   91.49%
+    Req/Sec    81.26k     5.78k  118.84k    76.62%
+  4875069 requests in 10.10s, 427.73MB read
+Requests/sec: 482700.22
+Transfer/sec:     42.35MB
+*/

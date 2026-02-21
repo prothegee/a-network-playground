@@ -19,6 +19,7 @@ TODO:
 [X] blocking I/O (not epoll)
 [X] keep-alive (manual)
 [X] websocket support
+[X] query parameters parsing
 [?] not full http spec
 [?] not async / non-blocking server
 */
@@ -182,32 +183,32 @@ impl ThreadPool {
         let shared_data = Arc::new((Mutex::new(VecDeque::with_capacity(size * 2)), Condvar::new()));
         let stop_signal = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(size);
-        
+
         for _ in 0..size {
             let shared = Arc::clone(&shared_data);
             let stop = Arc::clone(&stop_signal);
 
             workers.push(Some(thread::spawn(move || {
                 let (lock, cvar) = &*shared;
-                
+
                 loop {
                     let task: Job = {
                         let mut queue = lock.lock().unwrap();
-                        
+
                         while !stop.load(Ordering::Acquire) && queue.is_empty() {
                             queue = cvar.wait(queue).unwrap();
                         }
-                        
+
                         if stop.load(Ordering::Acquire) && queue.is_empty() {
                             return;
                         }
-                        
+
                         match queue.pop_front() {
                             Some(t) => t,
                             None => continue,
                         }
                     };
-                    
+
                     task();
                 }
             })));
@@ -405,6 +406,90 @@ impl WebSocketFrame {
 
 // --------------------------------------------------------- //
 
+// Fast query parameter parsing
+fn parse_query_params(query: &[u8]) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    if query.is_empty() {
+        return params;
+    }
+    let mut i = 0;
+    let len = query.len();
+
+    while i < len {
+        // Find key
+        let key_start = i;
+        while i < len && query[i] != b'=' && query[i] != b'&' {
+            i += 1;
+        }
+        let key_end = i;
+        let key = if key_start < key_end {
+            percent_decode(&query[key_start..key_end])
+        } else {
+            String::new()
+        };
+
+        // Check if we have '='
+        let mut value = String::new();
+        if i < len && query[i] == b'=' {
+            i += 1; // skip '='
+            let val_start = i;
+            while i < len && query[i] != b'&' {
+                i += 1;
+            }
+            let val_end = i;
+            if val_start < val_end {
+                value = percent_decode(&query[val_start..val_end]);
+            }
+        }
+
+        params.push((key, value));
+
+        // Skip '&' if present
+        if i < len && query[i] == b'&' {
+            i += 1;
+        }
+    }
+    params
+}
+
+fn percent_decode(bytes: &[u8]) -> String {
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &bytes[i+1..i+3];
+                if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or("00"), 16) {
+                    result.push(byte);
+                    i += 3;
+                } else {
+                    result.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                result.push(b' ');
+                i += 1;
+            }
+            c => {
+                result.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(result).unwrap_or_default()
+}
+
+fn split_path_query(path: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(qpos) = path.iter().position(|&b| b == b'?') {
+        (&path[..qpos], &path[qpos+1..])
+    } else {
+        (path, &[])
+    }
+}
+
+// --------------------------------------------------------- //
+
 #[inline]
 fn websocket_handshake(key: &str) -> String {
     let magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -455,20 +540,28 @@ fn handle_websocket_client(mut stream: std::net::TcpStream, room_name: String, p
 
     impl Drop for SocketCloser {
         fn drop(&mut self) {
-            // E.Q.: drogon ws handleConnectionClosed
+            // Equivalent to Drogon's handleConnectionClosed
             if self.stream.is_some() {
                 let mut rooms = self.peers.lock().unwrap();
                 if let Some(room_peers) = rooms.get_mut(&self.room_name) {
+                    let before_count = room_peers.len();
                     room_peers.retain(|peer| {
                         peer.peer_addr().map(|a| a != self.peer_addr).unwrap_or(false)
                     });
-                    
-                    // Remove room if empty
+                    let after_count = room_peers.len();
+
+                    // Only log if a connection was actually removed
+                    if before_count > after_count {
+                        println!("WebSocket client disconnected from room '{}'. Total in room: {}", 
+                                 self.room_name, after_count);
+                    }
+
+                    // Remove room if empty and log (like C++)
                     if room_peers.is_empty() {
                         rooms.remove(&self.room_name);
+                        println!("Room '{}' removed (empty).", self.room_name);
                     }
                 }
-                println!("WebSocket client disconnected from room '{}'.", self.room_name);
             }
         }
     }
@@ -564,16 +657,13 @@ fn parse_method(buffer: &[u8]) -> Option<&[u8]> {
 }
 
 // Parse HTTP path from raw buffer without String allocation
+// returns the full path including query string (if any)
 #[inline]
 fn parse_path(buffer: &[u8]) -> Option<&[u8]> {
     let start = buffer.iter().position(|&b| b == b' ')? + 1;
     let end = buffer[start..].iter().position(|&b| b == b' ' || b == b'\r')?;
-    let path = &buffer[start..start + end];
-    if let Some(qpos) = path.iter().position(|&b| b == b'?') {
-        Some(&path[..qpos])
-    } else {
-        Some(path)
-    }
+
+    Some(&buffer[start..start + end])
 }
 
 // Find end of headers in buffer, returns position after \r\n\r\n
@@ -599,11 +689,11 @@ fn join_path_segments(segments: &[&[u8]]) -> String {
     result
 }
 
-// Optimized client handler with keep-alive support (like C++ version)
+// Optimized client handler with keep-alive support
 fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
-    // Set TCP_NODELAY to disable Nagle's algorithm (like C++ setsockopt TCP_NODELAY)
+    // Set TCP_NODELAY to disable Nagle's algorithm
     let _ = stream.set_nodelay(true);
-    
+
     // Stack-allocated buffer to avoid heap allocations
     let mut buffer = [0u8; CLIENT_REQUEST_BUFFER_SIZE];
     let mut used = 0usize;
@@ -631,7 +721,7 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                 }
             };
 
-            // Parse method and path
+            // Parse method and full path (including query)
             let method = match parse_method(&buffer[processed..used]) {
                 Some(m) => m,
                 None => {
@@ -644,7 +734,7 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                 }
             };
 
-            let path = match parse_path(&buffer[processed..used]) {
+            let full_path = match parse_path(&buffer[processed..used]) {
                 Some(p) => p,
                 None => {
                     // Malformed request line
@@ -655,6 +745,10 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                     return;
                 }
             };
+
+            // Split path and query
+            let (path, query) = split_path_query(full_path);
+            let query_params = parse_query_params(query);
 
             // Route the request
             if method == b"GET" {
@@ -670,7 +764,7 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                         return;
                     }
                 } else if path == b"/rs/json" {
-                    // JSON response for /rs/json (specific path, not dynamic)
+                    // JSON response for /rs/json
                     const JSON_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
                                                  Content-Type: application/json\r\n\
                                                  Content-Length: 60\r\n\
@@ -680,12 +774,47 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                     if stream.write_all(JSON_RESPONSE).is_err() {
                         return;
                     }
+                } else if path == b"/rs/echo" {
+                    // Echo endpoint with query parameter "text"
+                    let response_body;
+
+                    // Find "text" parameter
+                    let text_param = query_params.iter().find(|(k, _)| k == "text");
+
+                    if let Some((_, text_value)) = text_param {
+                        response_body = format!("Echo: {}", text_value);
+                    } else {
+                        // Return all parameters as JSON
+                        if query_params.is_empty() {
+                            response_body = "{}".to_string();
+                        } else {
+                            let mut parts = Vec::new();
+                            for (k, v) in &query_params {
+                                parts.push(format!("\"{}\":\"{}\"", k, v));
+                            }
+                            response_body = format!("{{{}}}", parts.join(","));
+                        }
+                    }
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: keep-alive\r\n\
+                         \r\n\
+                         {}",
+                        response_body.len(),
+                        response_body
+                    );
+
+                    if stream.write_all(response.as_bytes()).is_err() { return; }
+                    if stream.flush().is_err() { return; }
                 } else if path.starts_with(b"/rs/") && !path.starts_with(b"/rs/json/") && path != b"/rs/json" {
                     // Dynamic path for /rs/* (except /rs/json and /rs/json/*)
                     // Parse path segments after /rs/
                     let mut segments: Vec<&[u8]> = Vec::new();
                     let mut start = 4; // after "/rs/"
-                    
+
                     while start < path.len() {
                         if let Some(end) = path[start..].iter().position(|&b| b == b'/') {
                             if start < start + end {
@@ -724,11 +853,11 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                         return;
                     }
                 } else if path.starts_with(b"/chat/") {
-                    // WebSocket dengan room name dari path
+                    // WebSocket with room name from path
                     // Parse room name from path after /chat/
                     let room_name_bytes = &path[6..]; // after "/chat/"
-                    
-                    // Validate room name (simple validation)
+
+                    // Validate room name
                     if room_name_bytes.is_empty() {
                         const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
                                                     Content-Length: 15\r\n\
@@ -817,16 +946,17 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
 fn main() {
     let listener = TcpListener::bind(format!("{}:{}", ADDRESS_IP, ADDRESS_PORT))
         .expect("Failed to bind port");
-    
-    // Set larger listen backlog (like C++ listen with 1024)
+
+    // Set larger listen backlog
     let _ = listener.set_ttl(64);
-    
+
     let pool = ThreadPool::new(CONNECTION_CONCURRENT_TARGET);
     let peers: WebSocketPeers = Arc::new(Mutex::new(HashMap::new()));
-    
+
     println!("backend_rs: run on {}:{}", ADDRESS_IP, ADDRESS_PORT);
     println!("  - HTTP endpoint: /rs");
     println!("  - JSON endpoint: /rs/json");
+    println!("  - Echo endpoint: /rs/echo?text=hello (query parameters)");
     println!("  - Dynamic path: /rs/{{path1}}/{{path2}}/... (except /rs/json)");
     println!("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)");
 
@@ -844,3 +974,17 @@ fn main() {
         }
     }
 }
+
+/*
+IMPORTANT:
+this implementation result:
+➜ wrk -c 100 -t 6 -d 10s http://localhost:9006/rs
+Running 10s test @ http://localhost:9006/rs
+  6 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   239.34us  497.83us   9.61ms   92.60%
+    Req/Sec    81.77k     7.27k  141.37k    79.40%
+  4897314 requests in 10.10s, 429.68MB read
+Requests/sec: 484917.72
+Transfer/sec:     42.55MB
+*/
