@@ -45,6 +45,7 @@ public
 /.zed/*.json
 
 /CMakePresets.json
+/perf.data
 
 backend_*.o
 backend_*.exe
