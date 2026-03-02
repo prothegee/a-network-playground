@@ -15,8 +15,8 @@ function _build_backend_cc() {
 function _build_backend_cc_drogon() {
 	g++ backend_cc_drogon/main.cc -o ./backend_cc_drogon.o \
 	-std=c++23 -Wall -Wextra -O3 \
-	-I/usr/include -I/usr/local/include -I/home/pr/include \
-	-L/usr/lib -L/usr/local/lib -L/home/pr/lib \
+	-I/usr/include -I/usr/local/include -I/mnt/256a1/include \
+	-L/usr/lib -L/usr/local/lib -L/mnt/256a1/lib \
 	-ldrogon -ltrantor -ljsoncpp -luuid -lz -lbrotlienc -lbrotlidec \
 	-lssl -lcrypto -lpq -lmysqlclient -lsqlite3 -lhiredis -lyaml-cpp \
 	-lpthread -ldl -lcares \
