@@ -8,6 +8,7 @@
 /.build
 /.cache
 /.target
+/.zig-out
 
 .svelte-kit
 
@@ -18,6 +19,7 @@ logs
 build
 cache
 target
+zig-out
 
 node_modules
 
