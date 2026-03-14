@@ -7,8 +7,8 @@ use std::thread;
 
 const ADDRESS_IP: &str = "0.0.0.0";
 const ADDRESS_PORT: u16 = 9006;
-const CONNECTION_CONCURRENT_TARGET: usize = 256;
 const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
+const CONNECTION_CONCURRENT_TARGET: usize = 256;
 
 // --------------------------------------------------------- //
 
@@ -20,6 +20,7 @@ TODO:
 [X] keep-alive (manual)
 [X] websocket support
 [X] query parameters parsing
+[X] dynamic thread count (hardware_concurrency)
 [?] not full http spec
 [?] not async / non-blocking server
 */
@@ -530,7 +531,7 @@ fn find_header_value<'a>(buffer: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-fn handle_websocket_client(mut stream: std::net::TcpStream, room_name: String, peers: WebSocketPeers) {
+fn handle_websocket_client(mut stream: TcpStream, room_name: String, peers: WebSocketPeers) {
     struct SocketCloser {
         stream: Option<std::net::TcpStream>,
         peer_addr: std::net::SocketAddr,
@@ -705,7 +706,17 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
             match stream.read(&mut buffer[used..]) {
                 Ok(0) => break, // Connection closed by client
                 Ok(n) => used += n,
-                Err(_) => break, // Connection error
+                Err(e) => {
+                    // Timeout or connection error
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        // Graceful timeout - close connection
+                        break;
+                    }
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    break; // Other errors
+                }
             }
         }
 
@@ -950,7 +961,17 @@ fn main() {
     // Set larger listen backlog
     let _ = listener.set_ttl(64);
 
-    let pool = ThreadPool::new(CONNECTION_CONCURRENT_TARGET);
+    // UPDATED: Dynamic thread pool size - matches C++ logic
+    // Use CONNECTION_CONCURRENT_TARGET (256) as base, but ensure at least hardware_concurrency()
+    // This is for BLOCKING I/O - threads wait on network, so we need more threads than cores
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1); // Fallback if detection fails
+    
+    // C++ equivalent: max(min(target, 256), hardware_concurrency)
+    let thread_count = CONNECTION_CONCURRENT_TARGET.max(cpu_count);
+    
+    let pool = ThreadPool::new(thread_count);
     let peers: WebSocketPeers = Arc::new(Mutex::new(HashMap::new()));
 
     println!("backend_rs: run on {}:{}", ADDRESS_IP, ADDRESS_PORT);
