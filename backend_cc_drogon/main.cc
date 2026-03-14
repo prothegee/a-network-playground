@@ -48,7 +48,8 @@ int main() {
 	printf("backend_cc_drogon: run on %s:%d\n", ADDRESS_IP, ADDRESS_PORT);
 
 	drogon::app().addListener(ADDRESS_IP, ADDRESS_PORT)
-				.setUploadPath("./upload")
+                .setDocumentRoot("./public")
+				.setUploadPath("u")
 				.setMaxConnectionNumPerIP(0)
 				.setThreadNum(0);
 
