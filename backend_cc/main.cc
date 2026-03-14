@@ -4,8 +4,11 @@
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <limits.h>
 
 #include <cstdint>
 #include <iostream>
@@ -30,6 +33,7 @@
 #define ADDRESS_PORT 9002
 #define CONNECTION_CONCURRENT_TARGET 256
 #define CLIENT_REQUEST_BUFFER_SIZE 8192 // in bytes
+#define PUBLIC_DIR "./public"            // directory for static files
 
 // --------------------------------------------------------- //
 
@@ -42,6 +46,7 @@ TODO:
 [X] websocket support
 [X] query parameters parsing
 [X] dynamic thread count (hardware_concurrency)
+[X] public file access
 [?] not full http spec
 [?] not async / non-blocking server
 */
@@ -473,6 +478,33 @@ std::pair<std::string_view, std::string_view> split_path_query(std::string_view 
 
 // --------------------------------------------------------- //
 
+// MIME type mapping for static files
+std::string mime_type(const std::string& ext) {
+    static std::map<std::string, std::string> mime_map = {
+        {"html", "text/html"},
+        {"css", "text/css"},
+        {"js", "application/javascript"},
+        {"json", "application/json"},
+        {"png", "image/png"},
+        {"jpg", "image/jpeg"},
+        {"jpeg", "image/jpeg"},
+        {"gif", "image/gif"},
+        {"svg", "image/svg+xml"},
+        {"webp", "image/webp"},
+        {"mp4", "video/mp4"},
+        {"webm", "video/webm"},
+        {"ogg", "video/ogg"},
+        {"txt", "text/plain"},
+        {"pdf", "application/pdf"}
+    };
+    std::string ext_lower = ext;
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+    auto it = mime_map.find(ext_lower);
+    return it != mime_map.end() ? it->second : "application/octet-stream";
+}
+
+// --------------------------------------------------------- //
+
 class HttpServer {
 private:
     int server_fd;
@@ -503,6 +535,14 @@ private:
         "Connection: keep-alive\r\n"
         "\r\n"
         "Not Found";
+    
+    const std::string forbidden_response =
+        "HTTP/1.1 403 Forbidden\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 9\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        "Forbidden";
     
     const std::string method_not_allowed_response =
         "HTTP/1.1 405 Method Not Allowed\r\n"
@@ -722,6 +762,88 @@ private:
         }
     }
 
+    // Attempt to serve a static file from PUBLIC_DIR.
+    // Returns true if a response was sent (200, 403, or 404), false if public dir missing.
+    bool try_serve_static_file(int client_fd, std::string_view path, size_t end_of_headers) {
+        (void)end_of_headers; // not used directly, but kept for symmetry with Rust version
+        std::string decoded_path = percent_decode(path);
+        // Remove leading slash
+        if (!decoded_path.empty() && decoded_path[0] == '/') {
+            decoded_path = decoded_path.substr(1);
+        }
+        if (decoded_path.empty()) {
+            return false; // let outer code send 404
+        }
+
+        std::string full_path_str = std::string(PUBLIC_DIR) + "/" + decoded_path;
+
+        char public_resolved[PATH_MAX];
+        if (realpath(PUBLIC_DIR, public_resolved) == nullptr) {
+            // Public directory doesn't exist or is inaccessible – cannot serve static files
+            return false;
+        }
+
+        char file_resolved[PATH_MAX];
+        if (realpath(full_path_str.c_str(), file_resolved) == nullptr) {
+            // File not found
+            send_all(client_fd, not_found_response.data(), not_found_response.size());
+            return true;
+        }
+
+        // Security: ensure the resolved path stays inside the public directory
+        if (strncmp(file_resolved, public_resolved, strlen(public_resolved)) != 0) {
+            send_all(client_fd, forbidden_response.data(), forbidden_response.size());
+            return true;
+        }
+
+        struct stat st;
+        if (stat(file_resolved, &st) != 0 || !S_ISREG(st.st_mode)) {
+            send_all(client_fd, not_found_response.data(), not_found_response.size());
+            return true;
+        }
+
+        std::string ext;
+        size_t dot_pos = decoded_path.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            ext = decoded_path.substr(dot_pos + 1);
+        }
+        std::string content_type = mime_type(ext);
+        size_t file_len = st.st_size;
+
+        std::ostringstream header_oss;
+        header_oss << "HTTP/1.1 200 OK\r\n"
+                   << "Content-Type: " << content_type << "\r\n"
+                   << "Content-Length: " << file_len << "\r\n"
+                   << "Connection: keep-alive\r\n"
+                   << "\r\n";
+        std::string headers = header_oss.str();
+        if (!send_all(client_fd, headers.data(), headers.size())) {
+            return true; // connection broken, but we already sent headers
+        }
+
+        int file_fd = open(file_resolved, O_RDONLY);
+        if (file_fd == -1) {
+            return true; // file disappeared after stat – abort
+        }
+
+        // Use a simple read/write loop (portable). For Linux, one could use sendfile.
+        char file_buf[8192];
+        ssize_t bytes_read;
+        while ((bytes_read = read(file_fd, file_buf, sizeof(file_buf))) > 0) {
+            if (!send_all(client_fd, file_buf, bytes_read)) {
+                close(file_fd);
+                return true;
+            }
+        }
+        close(file_fd);
+
+        if (bytes_read == -1) {
+            // read error – connection probably dead
+            return true;
+        }
+        return true;
+    }
+
 public:
     HttpServer(int port_num, size_t concurrency_target = 128)
         : port(port_num), running(true),
@@ -759,6 +881,7 @@ public:
         std::cout << "  - Echo endpoint: /cc/echo?text=hello (query parameters)\n";
         std::cout << "  - Dynamic path: /cc/{path1}/{path2}/... (except /cc/json)\n";
         std::cout << "  - WebSocket endpoint: /chat/{room_name} (per room broadcast)\n";
+        std::cout << "  - Static files from ./public at root (e.g., /image.jpg)\n";
 
         while (running) {
             sockaddr_in client_addr{};
@@ -857,36 +980,27 @@ private:
 
             // WebSocket check with room name (/chat/{room_name})
             if (method == "GET" && path.substr(0, 6) == "/chat/" && path.length() > 6) {
-                // Extract room name from path after /chat/
                 std::string room_name = std::string(path.substr(6));
-                
-                // Validate room name (simple validation)
                 if (room_name.empty()) {
                     send_all(client_fd, bad_request_response.data(), bad_request_response.size());
                     return;
                 }
-                
-                // Extract headers to check for WebSocket upgrade
                 std::string headers(full_buffer.data(), end_of_headers + 2);
                 std::string upgrade = extract_header_value(headers, "Upgrade:");
                 std::string connection = extract_header_value(headers, "Connection:");
                 std::string sec_websocket_key = extract_header_value(headers, "Sec-WebSocket-Key:");
 
-                // Check if this is a WebSocket upgrade request
                 if (!upgrade.empty() && !connection.empty() && !sec_websocket_key.empty()) {
                     bool is_websocket = (upgrade.find("websocket") != std::string::npos);
                     bool is_upgrade = (connection.find("Upgrade") != std::string::npos);
-
                     if (is_websocket && is_upgrade) {
-                        // Perform WebSocket handshake
                         std::string handshake_response = websocket_handshake_response(sec_websocket_key);
                         send_all(client_fd, handshake_response.c_str(), handshake_response.length());
-                        // Switch to WebSocket mode with room name
                         handle_websocket(client_fd, room_name);
                         return;
                     }
                 }
-                // Not a WebSocket request, fall through to normal HTTP (will return 404)
+                // Not a WebSocket request, fall through to normal HTTP (will be handled below)
             }
 
             const char* response = nullptr;
@@ -933,14 +1047,9 @@ private:
                 response = dynamic_response.c_str();
                 response_len = dynamic_response.length();
             } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" && path.substr(0, 9) != "/cc/json/") {
-                // Dynamic path for /cc/* (except /cc/json and /cc/json/*)
                 auto segments = parse_path_segments(path);
-                
-                // Create response body based on path segments
                 std::string path_string = join_path_segments(segments);
                 std::string body = segments.empty() ? "value path: /cc/" : "value path: /cc/" + path_string;
-                
-                // Build HTTP response
                 std::ostringstream oss;
                 oss << "HTTP/1.1 200 OK\r\n"
                     << "Content-Type: text/plain\r\n"
@@ -952,10 +1061,25 @@ private:
                 response = dynamic_response.c_str();
                 response_len = dynamic_response.length();
             } else {
-                response = not_found_response.data();
-                response_len = not_found_response.size();
+                // Try to serve static file
+                if (try_serve_static_file(client_fd, path, end_of_headers)) {
+                    // Response already sent; shift buffer and continue
+                    size_t consumed = end_of_headers + 4;
+                    if (consumed < buffer_used) {
+                        memmove(buffer, buffer + consumed, buffer_used - consumed);
+                        buffer_used -= consumed;
+                    } else {
+                        buffer_used = 0;
+                    }
+                    continue;
+                } else {
+                    // Public directory missing or not applicable – send 404
+                    response = not_found_response.data();
+                    response_len = not_found_response.size();
+                }
             }
 
+            // Send the response (for non‑static routes)
             struct iovec iov;
             iov.iov_base = const_cast<char*>(response);
             iov.iov_len = response_len;
@@ -966,6 +1090,7 @@ private:
                 return;
             }
 
+            // Shift buffer for next request (keep‑alive)
             size_t consumed = end_of_headers + 4;
             if (consumed < buffer_used) {
                 memmove(buffer, buffer + consumed, buffer_used - consumed);
