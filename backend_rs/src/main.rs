@@ -4,11 +4,15 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, Mutex};
 use std::thread;
+use std::fs::{self, File};
+use std::io::copy;
+use std::path::{Path};
 
 const ADDRESS_IP: &str = "0.0.0.0";
 const ADDRESS_PORT: u16 = 9006;
 const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 const CONNECTION_CONCURRENT_TARGET: usize = 256;
+const PUBLIC_DIR: &str = "./public";
 
 // --------------------------------------------------------- //
 
@@ -21,8 +25,9 @@ TODO:
 [X] websocket support
 [X] query parameters parsing
 [X] dynamic thread count (hardware_concurrency)
-[?] not full http spec
-[?] not async / non-blocking server
+[X] public file access
+[?] not full http spec > POSTPONE
+[?] not async / non-blocking server > POSTPONE
 */
 
 // --------------------------------------------------------- //
@@ -690,6 +695,30 @@ fn join_path_segments(segments: &[&[u8]]) -> String {
     result
 }
 
+// --------------------------------------------------------- //
+
+fn mime_type(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "html" => "text/html",
+        "css"  => "text/css",
+        "js"   => "application/javascript",
+        "json" => "application/json",
+        "png"  => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif"  => "image/gif",
+        "svg"  => "image/svg+xml",
+        "webp" => "image/webp",
+        "mp4"  => "video/mp4",
+        "webm" => "video/webm",
+        "ogg"  => "video/ogg",
+        "txt"  => "text/plain",
+        "pdf"  => "application/pdf",
+        _      => "application/octet-stream",
+    }
+}
+
+// --------------------------------------------------------- //
+
 // Optimized client handler with keep-alive support
 fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
     // Set TCP_NODELAY to disable Nagle's algorithm
@@ -906,14 +935,115 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                         return;
                     }
                 } else {
-                    const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
-                                              Content-Length: 9\r\n\
-                                              Connection: keep-alive\r\n\
-                                              \r\n\
-                                              Not Found";
-                    if stream.write_all(NOT_FOUND).is_err() {
-                        return;
+                    // Attempt to serve static file from ./public
+                    let decoded_path = percent_decode(path);
+                    let requested_path = Path::new(&decoded_path);
+
+                    // Reject empty path or root (could serve index.html, but we return 404 for simplicity)
+                    if requested_path.components().count() == 0 {
+                        const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
+                                                  Content-Length: 9\r\n\
+                                                  Connection: keep-alive\r\n\
+                                                  \r\n\
+                                                  Not Found";
+                        if stream.write_all(NOT_FOUND).is_err() { return; }
+                        continue;
                     }
+
+                    // Build the full filesystem path
+                    let full_path = Path::new(PUBLIC_DIR).join(requested_path.strip_prefix("/").unwrap_or(requested_path));
+
+                    // Security: canonicalize both public dir and full path, then verify prefix
+                    let public_canon = match fs::canonicalize(PUBLIC_DIR) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // Public dir doesn't exist – treat as 404
+                            const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
+                                                      Content-Length: 9\r\n\
+                                                      Connection: keep-alive\r\n\
+                                                      \r\n\
+                                                      Not Found";
+                            if stream.write_all(NOT_FOUND).is_err() { return; }
+                            continue;
+                        }
+                    };
+
+                    let file_canon = match fs::canonicalize(&full_path) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // File not found
+                            const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
+                                                      Content-Length: 9\r\n\
+                                                      Connection: keep-alive\r\n\
+                                                      \r\n\
+                                                      Not Found";
+                            if stream.write_all(NOT_FOUND).is_err() { return; }
+                            continue;
+                        }
+                    };
+
+                    // Ensure the file is inside the public directory
+                    if !file_canon.starts_with(&public_canon) {
+                        const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\
+                                                  Content-Length: 9\r\n\
+                                                  Connection: keep-alive\r\n\
+                                                  \r\n\
+                                                  Forbidden";
+                        if stream.write_all(FORBIDDEN).is_err() { return; }
+                        continue;
+                    }
+
+                    // Check that it's a regular file (not a directory)
+                    if !file_canon.is_file() {
+                        const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
+                                                  Content-Length: 9\r\n\
+                                                  Connection: keep-alive\r\n\
+                                                  \r\n\
+                                                  Not Found";
+                        if stream.write_all(NOT_FOUND).is_err() { return; }
+                        continue;
+                    }
+
+                    // Get file size and extension for Content-Type
+                    let metadata = match fs::metadata(&file_canon) {
+                        Ok(m) => m,
+                        Err(_) => {
+                            const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n\
+                                                      Content-Length: 9\r\n\
+                                                      Connection: keep-alive\r\n\
+                                                      \r\n\
+                                                      Not Found";
+                            if stream.write_all(NOT_FOUND).is_err() { return; }
+                            continue;
+                        }
+                    };
+                    let file_len = metadata.len();
+                    let ext = file_canon.extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("");
+                    let content_type = mime_type(ext);
+
+                    // Send headers
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: {}\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: keep-alive\r\n\
+                         \r\n",
+                        content_type, file_len
+                    );
+                    if stream.write_all(headers.as_bytes()).is_err() { return; }
+
+                    // Stream the file
+                    let mut file = match File::open(&file_canon) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            // File became inaccessible – abort connection
+                            return;
+                        }
+                    };
+                    if copy(&mut file, &mut stream).is_err() { return; }
+                    if stream.flush().is_err() { return; }
                 }
             } else {
                 const METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
