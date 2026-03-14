@@ -4,8 +4,11 @@
 # --------------------------------------------------------- #
 
 function _build_backend_cc() {
+    echo "backend_cc";
     g++ -o ./backend_cc.o ./backend_cc/main.cc \
         -std=c++23 \
+        -Wall \
+        -Wextra \
         -O3 \
         -flto \
         -pthread \
@@ -13,8 +16,9 @@ function _build_backend_cc() {
 }
 
 function _build_backend_cc_drogon() {
-	g++ backend_cc_drogon/main.cc -o ./backend_cc_drogon.o \
-	-std=c++23 -Wall -Wextra -O3 \
+	echo "backend_cc_drogon";
+    g++ backend_cc_drogon/main.cc -o ./backend_cc_drogon.o \
+	-std=c++23 -Wall -Wextra -O3 -pthread -march=native \
 	-I/usr/include -I/usr/local/include -I/mnt/256a1/include \
 	-L/usr/lib -L/usr/local/lib -L/mnt/256a1/lib \
 	-ldrogon -ltrantor -ljsoncpp -luuid -lz -lbrotlienc -lbrotlidec \
@@ -27,18 +31,27 @@ function _build_backend_cc_drogon() {
 # --------------------------------------------------------- #
 
 function _build_backend_rs() {
+    echo "backend_rs";
     rustc ./backend_rs/src/main.rs -o ./backend_rs.o \
-      -C opt-level=3 \
-      -C lto=true \
+      -C opt-level=z \
+      -C lto=fat \
       -C codegen-units=1 \
       -C panic=abort \
-      -C target-cpu=native;
+      -C target-cpu=native \
+      -C strip=debuginfo;
+    # opt-level: z,3
+    # lto: fat,true
+    # codegen-units: 1
+    # panic: abort
+    # target-cpu: native
+    # strip: debuginfo
 }
 
 # --------------------------------------------------------- #
 # --------------------------------------------------------- #
 
 function _build_backend_zig() {
+    echo "backend_zig";
     zig build-exe backend_zig/main.zig --name backend_zig.o;
 }
 
@@ -46,6 +59,7 @@ function _build_backend_zig() {
 # --------------------------------------------------------- #
 
 function _build_backend_go() {
+    echo "backend_go";
 	go build -o ./backend_go.o ./backend_go;
 }
 
