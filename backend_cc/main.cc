@@ -25,11 +25,9 @@
 #include <algorithm>
 #include <array>
 #include <sstream>
-#include <cctype>
 
 #define ADDRESS_IP "0.0.0.0"
 #define ADDRESS_PORT 9002
-#define CONNECTION_TIMEOUT_SEC 6
 #define CONNECTION_CONCURRENT_TARGET 256
 #define CLIENT_REQUEST_BUFFER_SIZE 8192 // in bytes
 
@@ -43,6 +41,7 @@ TODO:
 [X] keep-alive (manual)
 [X] websocket support
 [X] query parameters parsing
+[X] dynamic thread count (hardware_concurrency)
 [?] not full http spec
 [?] not async / non-blocking server
 */
