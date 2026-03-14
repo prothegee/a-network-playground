@@ -3,11 +3,11 @@
 
 // --------------------------------------------------------- //
 
-int main() {
-	char address[32] = "0.0.0.0";
-	int16_t port = 9001;
+#define ADDRESS_IP "0.0.0.0"
+#define ADDRESS_PORT 9002
 
-	printf("backend_c: run on %s:%d\n", address, port);
+int main() {
+	printf("backend_c: run on %s:%d\n", ADDRESS_IP, ADDRESS_PORT);
 
 	// TBD
 
