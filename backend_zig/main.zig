@@ -39,7 +39,7 @@ fn runServer(io: std.Io) !void {
 
             request.respond("home", .{
                 .status = std.http.Status.ok,
-                .keep_alive = false,
+                .keep_alive = true,
                 .version = std.http.Version.@"HTTP/1.1",
                 .extra_headers = &.{header},
             }) catch |err| {
@@ -69,3 +69,17 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("backend_zig: run on {s}:{d}\n", .{ ADDRESS_IP, ADDRESS_PORT });
     try runServer(init.io);
 }
+
+//
+// IMPORTANT:
+// this implementation result:
+// ➜ wrk -c 100 -t 6 -d 10s http://localhost:9007/zig
+// Running 10s test @ http://localhost:9007/zig
+//   6 threads and 100 connections
+//   Thread Stats   Avg      Stdev     Max   +/- Stdev
+//     Latency     1.91ms  188.73us   5.15ms   83.67%
+//     Req/Sec     8.24k   366.45     8.77k    71.78%
+//   496603 requests in 10.10s, 41.20MB read
+// Requests/sec:  49167.99
+// Transfer/sec:      4.08MB
+//
