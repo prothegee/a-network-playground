@@ -3,13 +3,12 @@
 playground to apply network application.
 
 programming language implementations are:
-- [?] c
+<!-- - [?] c -->
 - [?] cc (c++)
 - [?] cc_drogon
 - [?] go
 - [?] go_fiber
 - [?] rust
-- [?] rust_ohkami
 
 __*IMPORTANT*:__
 
@@ -22,14 +21,14 @@ __*IMPORTANT*:__
 
 - check [goal endpoint pattern](#goal endpoint pattern), each section has it own purpose
 
-- each framework should be able:
-    - initialize plugin/s before main framework run
-    - has middleware
-    - c.r.u.d. operation (with postgresql)
-    - c.r.u.d. session operation (redis)
-    - message queue (redis)
-    - simple chat app with websocket
-    - consume topic with websocket (kafka)
+<!-- - each framework should be able: -->
+<!--     - initialize plugin/s before main framework run -->
+<!--     - has middleware -->
+<!--     - c.r.u.d. operation (with postgresql) -->
+<!--     - c.r.u.d. session operation (redis) -->
+<!--     - message queue (redis) -->
+<!--     - simple chat app with websocket -->
+<!--     - consume topic with websocket (kafka) -->
 
 <br>
 
