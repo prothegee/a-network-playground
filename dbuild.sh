@@ -5,23 +5,23 @@ mkdir -p logs public;
 
 source env.sh;
 
+# --------------------------------------------------------- #
+
 # backend_c
-gcc -o ./backend_c.o ./backend_c/main.c -std=c23 -g;
+# todo
 
 # --------------------------------------------------------- #
 
 # backend_cc
-_build_backend_cc;
+# todo
 
 # backend_cc_drogon
-_build_backend_cc_drogon;
+# todo
 
 # --------------------------------------------------------- #
 
 # backend_go
-_build_backend_go;
-
-# backend_go_fiber
+# todo
 
 # --------------------------------------------------------- #
 
