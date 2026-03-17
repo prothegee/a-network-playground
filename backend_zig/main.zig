@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const ADDRESS_IP: []const u8 = "0.0.0.0";
-const ADDRESS_PORT: u16 = 9007;
+const ADDRESS_PORT: u16 = 9006;
 const DEFAULT_BUFFER: i32 = 1024;
 
 fn runServer(io: std.Io) !void {
@@ -83,3 +83,4 @@ pub fn main(init: std.process.Init) !void {
 // Requests/sec:  49167.99
 // Transfer/sec:      4.08MB
 //
+
