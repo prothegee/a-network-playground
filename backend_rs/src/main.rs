@@ -9,7 +9,7 @@ use std::io::copy;
 use std::path::{Path};
 
 const ADDRESS_IP: &str = "0.0.0.0";
-const ADDRESS_PORT: u16 = 9006;
+const ADDRESS_PORT: u16 = 9005;
 const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 const CONNECTION_CONCURRENT_TARGET: usize = 256;
 const PUBLIC_DIR: &str = "./public";
@@ -1129,8 +1129,8 @@ fn main() {
 /*
 IMPORTANT:
 this implementation result:
-➜ wrk -c 100 -t 6 -d 10s http://localhost:9006/rs
-Running 10s test @ http://localhost:9006/rs
+➜ wrk -c 100 -t 6 -d 10s http://localhost:9005/rs
+Running 10s test @ http://localhost:9005/rs
   6 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
     Latency   239.34us  497.83us   9.61ms   92.60%
@@ -1139,3 +1139,4 @@ Running 10s test @ http://localhost:9006/rs
 Requests/sec: 484917.72
 Transfer/sec:     42.55MB
 */
+
