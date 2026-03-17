@@ -1,0 +1,10 @@
+If:
+  PathMatch: .*\.(cpp|cc|cxx|hh|hpp|hxx)$
+CompileFlags:
+  Add: [-std=c++23, -Wall]
+
+---
+If:
+  PathMatch: .*\.(h|c)$
+CompileFlags:
+  Add: [-std=c23, -Wall]
