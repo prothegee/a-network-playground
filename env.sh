@@ -1,4 +1,15 @@
-
+function _build_backend_c() {
+    echo "backend_c";
+    gcc -o ./backend_c.o ./backend_c/main.c \
+        -std=c23 \
+        -D_GNU_SOURCE \
+        -Wall \
+        -Wextra \
+        -O3 \
+        -flto \
+        -pthread \
+        -march=native;
+}
 
 # --------------------------------------------------------- #
 # --------------------------------------------------------- #
@@ -67,9 +78,11 @@ function _build_backend_go() {
 # --------------------------------------------------------- #
 
 function _build_backend_all() {
+    _build_backend_c;
     _build_backend_cc;
     _build_backend_cc_drogon;
     _build_backend_rs;
     _build_backend_zig;
     _build_backend_go;
 }
+
