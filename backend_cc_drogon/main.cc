@@ -60,3 +60,17 @@ int main() {
 	return 0;
 }
 
+/*
+IMPORTANT:
+this implementation result:
+➜ wrk -c 100 -t 6 -d 10s http://localhost:9003/cc-drogon
+Running 10s test @ http://localhost:9003/cc-drogon
+  6 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   263.10us  460.84us   5.21ms   90.54%
+    Req/Sec    87.70k     4.19k  101.60k    71.74%
+  5278544 requests in 10.10s, 714.83MB read
+Requests/sec: 522643.02
+Transfer/sec:     70.78MB
+*/
+
