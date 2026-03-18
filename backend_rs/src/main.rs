@@ -26,8 +26,8 @@ TODO:
 [X] query parameters parsing
 [X] dynamic thread count (hardware_concurrency)
 [X] public file access
-[?] not full http spec > POSTPONE
-[?] not async / non-blocking server > POSTPONE
+[?] not full http spec
+[?] not async / non-blocking server
 */
 
 // --------------------------------------------------------- //
