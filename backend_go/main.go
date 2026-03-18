@@ -138,3 +138,17 @@ func main() {
 	log.Fatal(http.ListenAndServe(ADDRESS, nil))
 }
 
+/*
+IMPORTANT:
+this implementation result:
+➜ wrk -c 100 -t 6 -d 10s http://localhost:9004/go
+Running 10s test @ http://localhost:9004/go
+  6 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   422.83us  498.64us   6.89ms   85.32%
+    Req/Sec    49.18k     3.30k   58.66k    68.00%
+  2937576 requests in 10.01s, 294.16MB read
+Requests/sec: 293531.26
+Transfer/sec:     29.39MB
+*/
+
