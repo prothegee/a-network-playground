@@ -68,5 +68,5 @@
 
 > 💡 **Rule of thumb**: For simple HTTP text endpoints under load, **synchronous implementations in compiled languages** (Rust, Zig, C++, C) deliver near-identical top-tier performance. Choose based on ecosystem, safety guarantees, and developer preference—not raw speed alone.
 
-###### NOTE: this summarize generate by A.I.
+###### NOTE: this summarize created by A.I.
 
