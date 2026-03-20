@@ -18,7 +18,28 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 // [X] dynamic thread count (hardware_concurrency)
 // [?] public file access
 // [X] not full http spec
-// [X] not async / non-blocking server
+// [?] not async / non-blocking server
+//
+// CHECK:
+// [?] `/zig/echo?` proper params
+//     - it should be
+//     ```
+//     # All params as JSON
+//     curl http://localhost:9006/zig/echo?text=1&foo=bar&z=&s=123
+//     # → {"text":"1","foo":"bar","z":null,"s":"123"}
+//
+//     # No params
+//     curl http://localhost:9006/zig/echo
+//     # → null
+//
+//     # Empty value
+//     curl http://localhost:9006/zig/echo?key=
+//     # → {"key":null}
+//
+//     # Special chars (JSON escaped)
+//     curl http://localhost:9006/zig/echo?msg=hello%22world
+//     # → {"msg":"hello\"world"}
+//     ```
 //
 
 // --------------------------------------------------------- //
@@ -39,8 +60,9 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             if (err == error.HttpConnectionClosing) break;
             break;
         };
-        // server manages lifecycle automatically via discardBody()
-        
+        // server manages lifecycle automatically via discardBody()?
+        // seems familiar
+
         const path = request.head.target;
         
         if (std.mem.eql(u8, path, "/zig")) {
