@@ -1,0 +1,1492 @@
+#include <algorithm>
+#include <arpa/inet.h>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
+#include <csignal>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <functional>
+#include <iostream>
+#include <limits.h>
+#include <map>
+#include <mutex>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <sys/epoll.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#define ADDRESS_IP "0.0.0.0"
+#define ADDRESS_PORT 9003
+#define CONNECTION_CONCURRENT_TARGET 256
+#define CLIENT_REQUEST_BUFFER_SIZE 8192 // in bytes
+#define PUBLIC_DIR "./public"           // directory for static files
+#define MAX_EVENTS 1024
+#define EPOLL_TIMEOUT_MS 100
+
+// --------------------------------------------------------- //
+/*
+TODO:
+[X] multi-threaded http server
+[X] threadpool for scalability
+[X] blocking I/O (not epoll)
+[X] keep-alive (manual)
+[X] websocket support
+[X] query parameters parsing
+[X] dynamic thread count (hardware_concurrency)
+[X] public file access
+[X] async / non-blocking server (epoll)
+[?] not full http spec
+*/
+// --------------------------------------------------------- //
+
+// Global WebSocket connections per room (like Drogon's g_connections)
+using RoomName = std::string;
+
+struct WebSocketRoom {
+    std::vector<int> connections;
+};
+
+static std::map<RoomName, WebSocketRoom> g_websocket_rooms;
+static std::mutex g_rooms_mutex;
+
+// --------------------------------------------------------- //
+
+class SignalHandler {
+public:
+    SignalHandler() { std::signal(SIGPIPE, SIG_IGN); }
+} sigpipe_handler;
+
+// --------------------------------------------------------- //
+
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks; // ← Needs <queue> and <functional>
+    std::mutex queue_mutex;
+    std::condition_variable condition; // ← Needs <condition_variable>
+    std::atomic<bool> stop;
+
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task; // ← Needs <functional>
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] {
+                            return this->stop || !this->tasks.empty();
+                        });
+                        if (this->stop && this->tasks.empty()) {
+                            return;
+                        }
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    try {
+                        task();
+                    } catch (...) {
+                        // prevent worker thread termination
+                    }
+                }
+            });
+        }
+    }
+
+    template <class F> void enqueue(F &&f) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if (stop) {
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            }
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+};
+
+// --------------------------------------------------------- //
+
+// WebSocket Frame Structure (RFC 6455)
+class WebSocketFrame {
+public:
+    enum Opcode : uint8_t {
+        CONTINUATION = 0x0,
+        TEXT = 0x1,
+        BINARY = 0x2,
+        CLOSE = 0x8,
+        PING = 0x9,
+        PONG = 0xA
+    };
+
+    bool fin;
+    bool mask;
+    Opcode opcode;
+    uint64_t payload_length;
+    std::array<uint8_t, 4> masking_key;
+    std::vector<uint8_t> payload;
+
+    WebSocketFrame()
+        : fin(true), mask(false), opcode(TEXT), payload_length(0) {}
+
+    // Parse WebSocket frame from buffer (RFC 6455)
+    static bool parse(const uint8_t *data, size_t len, WebSocketFrame &frame,
+                      size_t &consumed) {
+        if (len < 2)
+            return false;
+
+        const uint8_t *ptr = data;
+
+        // First byte: FIN + RSV + Opcode
+        frame.fin = (*ptr & 0x80) != 0;
+        frame.opcode = static_cast<Opcode>(*ptr & 0x0F);
+        ptr++;
+
+        // Second byte: MASK + Payload length
+        frame.mask = (*ptr & 0x80) != 0;
+        uint8_t payload_len_indicator = *ptr & 0x7F;
+        ptr++;
+
+        // Extended payload length
+        if (payload_len_indicator == 126) {
+            if (len < static_cast<size_t>(ptr - data) + 2)
+                return false;
+            frame.payload_length =
+                (static_cast<uint64_t>(ptr[0]) << 8) | ptr[1];
+            ptr += 2;
+        } else if (payload_len_indicator == 127) {
+            if (len < static_cast<size_t>(ptr - data) + 8)
+                return false;
+            frame.payload_length = 0;
+            for (int i = 0; i < 8; i++) {
+                frame.payload_length = (frame.payload_length << 8) | ptr[i];
+            }
+            ptr += 8;
+        } else {
+            frame.payload_length = payload_len_indicator;
+        }
+
+        // Masking key
+        if (frame.mask) {
+            if (len < static_cast<size_t>(ptr - data) + 4)
+                return false;
+            std::copy(ptr, ptr + 4, frame.masking_key.begin());
+            ptr += 4;
+        }
+
+        // Payload
+        size_t payload_offset = static_cast<size_t>(ptr - data);
+        size_t total_frame_size = payload_offset + frame.payload_length;
+        if (len < total_frame_size)
+            return false;
+
+        frame.payload.resize(frame.payload_length);
+        if (frame.payload_length > 0) {
+            std::copy(ptr, ptr + frame.payload_length, frame.payload.begin());
+            // Unmask payload if masked
+            if (frame.mask) {
+                for (size_t i = 0; i < frame.payload_length; i++) {
+                    frame.payload[i] ^= frame.masking_key[i % 4];
+                }
+            }
+        }
+
+        consumed = total_frame_size;
+        return true;
+    }
+
+    // Serialize WebSocket frame to buffer (no mask for server->client)
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buffer;
+
+        uint8_t first_byte = (fin ? 0x80 : 0x00) | static_cast<uint8_t>(opcode);
+        buffer.push_back(first_byte);
+
+        if (payload_length <= 125) {
+            buffer.push_back(static_cast<uint8_t>(payload_length));
+        } else if (payload_length <= 65535) {
+            buffer.push_back(126);
+            buffer.push_back(
+                static_cast<uint8_t>((payload_length >> 8) & 0xFF));
+            buffer.push_back(static_cast<uint8_t>(payload_length & 0xFF));
+        } else {
+            buffer.push_back(127);
+            for (int i = 7; i >= 0; i--) {
+                buffer.push_back(
+                    static_cast<uint8_t>((payload_length >> (i * 8)) & 0xFF));
+            }
+        }
+
+        buffer.insert(buffer.end(), payload.begin(), payload.end());
+        return buffer;
+    }
+
+    static WebSocketFrame create_text_frame(const std::string &text) {
+        WebSocketFrame frame;
+        frame.opcode = TEXT;
+        frame.payload.assign(text.begin(), text.end());
+        frame.payload_length = text.length();
+        return frame;
+    }
+
+    static WebSocketFrame
+    create_pong_frame(const std::vector<uint8_t> &payload = {}) {
+        WebSocketFrame frame;
+        frame.opcode = PONG;
+        frame.payload = payload;
+        frame.payload_length = payload.size();
+        return frame;
+    }
+
+    static WebSocketFrame create_close_frame(uint16_t code = 1000,
+                                             const std::string &reason = "") {
+        WebSocketFrame frame;
+        frame.opcode = CLOSE;
+        // Close frame payload: 2-byte code + optional reason
+        frame.payload.resize(2 + reason.length());
+        frame.payload[0] = (code >> 8) & 0xFF;
+        frame.payload[1] = code & 0xFF;
+        if (!reason.empty()) {
+            std::copy(reason.begin(), reason.end(), frame.payload.begin() + 2);
+        }
+        frame.payload_length = frame.payload.size();
+        return frame;
+    }
+};
+
+// --------------------------------------------------------- //
+
+// Base64 encoding for WebSocket accept key
+class Base64Encoder {
+public:
+    static std::string encode(const std::string &data) {
+        static const char *encoding_table =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        size_t data_len = data.length();
+        size_t output_len = 4 * ((data_len + 2) / 3);
+        std::string output(output_len, ' ');
+
+        size_t i = 0, j = 0;
+        while (i < data_len) {
+            uint32_t octet_a =
+                i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
+            uint32_t octet_b =
+                i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
+            uint32_t octet_c =
+                i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
+
+            uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+            output[j++] = encoding_table[(triple >> 18) & 0x3F];
+            output[j++] = encoding_table[(triple >> 12) & 0x3F];
+            output[j++] = encoding_table[(triple >> 6) & 0x3F];
+            output[j++] = encoding_table[triple & 0x3F];
+        }
+
+        size_t mod_table[] = {0, 2, 1};
+        size_t padding = mod_table[data_len % 3];
+        for (size_t i = 0; i < padding; i++) {
+            output[output_len - 1 - i] = '=';
+        }
+
+        return output;
+    }
+};
+
+// --------------------------------------------------------- //
+
+// SHA-1 implementation for WebSocket handshake
+class SHA1 {
+private:
+    uint32_t state[5];
+    uint64_t count;
+    uint8_t buffer[64];
+
+    void transform(const uint8_t *block) {
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3],
+                 e = state[4];
+        uint32_t w[80];
+
+        for (int i = 0; i < 16; i++) {
+            w[i] = (block[i * 4 + 0] << 24) | (block[i * 4 + 1] << 16) |
+                   (block[i * 4 + 2] << 8) | (block[i * 4 + 3]);
+        }
+
+        for (int i = 16; i < 80; i++) {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]);
+            w[i] = (w[i] << 1) | (w[i] >> 31);
+        }
+
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) {
+                f = (b & c) | (~b & d);
+                k = 0x5A827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+
+            uint32_t temp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = (b << 30) | (b >> 2);
+            b = a;
+            a = temp;
+        }
+
+        state[0] += a;
+        state[1] += b;
+        state[2] += c;
+        state[3] += d;
+        state[4] += e;
+    }
+
+public:
+    SHA1() { reset(); }
+
+    void reset() {
+        state[0] = 0x67452301;
+        state[1] = 0xEFCDAB89;
+        state[2] = 0x98BADCFE;
+        state[3] = 0x10325476;
+        state[4] = 0xC3D2E1F0;
+        count = 0;
+    }
+
+    void update(const uint8_t *data, size_t len) {
+        for (size_t i = 0; i < len; i++) {
+            buffer[count % 64] = data[i];
+            count++;
+            if (count % 64 == 0) {
+                transform(buffer);
+            }
+        }
+    }
+
+    void finalize(uint8_t *digest) {
+        uint8_t padding[64];
+        size_t padding_len = 64 - (count % 64);
+        if (padding_len < 9)
+            padding_len += 64;
+
+        padding[0] = 0x80;
+        for (size_t i = 1; i < padding_len - 8; i++) {
+            padding[i] = 0;
+        }
+
+        uint64_t bitlen = count * 8;
+        for (size_t i = 0; i < 8; i++) {
+            padding[padding_len - 8 + i] = (bitlen >> (56 - i * 8)) & 0xFF;
+        }
+
+        update(padding, padding_len);
+
+        for (int i = 0; i < 5; i++) {
+            digest[i * 4 + 0] = (state[i] >> 24) & 0xFF;
+            digest[i * 4 + 1] = (state[i] >> 16) & 0xFF;
+            digest[i * 4 + 2] = (state[i] >> 8) & 0xFF;
+            digest[i * 4 + 3] = state[i] & 0xFF;
+        }
+    }
+
+    static std::string hash(const std::string &input) {
+        SHA1 sha1;
+        sha1.update(reinterpret_cast<const uint8_t *>(input.data()),
+                    input.length());
+        uint8_t digest[20];
+        sha1.finalize(digest);
+        return std::string(reinterpret_cast<char *>(digest), 20);
+    }
+};
+
+// --------------------------------------------------------- //
+
+// Fast query parameter parsing
+struct QueryParam {
+    std::string key;
+    std::string value;
+};
+
+std::string percent_decode(std::string_view input) {
+    std::string result;
+    result.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && i + 2 < input.size()) {
+            int hex_val;
+            std::istringstream iss(std::string(input.substr(i + 1, 2)));
+            if (iss >> std::hex >> hex_val) {
+                result.push_back(static_cast<char>(hex_val));
+                i += 2;
+            } else {
+                result.push_back('%');
+            }
+        } else if (input[i] == '+') {
+            result.push_back(' ');
+        } else {
+            result.push_back(input[i]);
+        }
+    }
+
+    return result;
+}
+
+std::vector<QueryParam> parse_query_params(std::string_view query) {
+    std::vector<QueryParam> params;
+    if (query.empty())
+        return params;
+
+    size_t pos = 0;
+    while (pos < query.size()) {
+        size_t amp_pos = query.find('&', pos);
+        if (amp_pos == std::string_view::npos)
+            amp_pos = query.size();
+
+        std::string_view pair = query.substr(pos, amp_pos - pos);
+        size_t eq_pos = pair.find('=');
+        if (eq_pos != std::string_view::npos) {
+            std::string_view key = pair.substr(0, eq_pos);
+            std::string_view val = pair.substr(eq_pos + 1);
+            params.push_back({percent_decode(key), percent_decode(val)});
+        } else {
+            params.push_back({percent_decode(pair), ""});
+        }
+
+        pos = amp_pos + 1;
+    }
+
+    return params;
+}
+
+std::pair<std::string_view, std::string_view>
+split_path_query(std::string_view full_path) {
+    size_t qpos = full_path.find('?');
+    if (qpos == std::string_view::npos) {
+        return {full_path, {}};
+    }
+    return {full_path.substr(0, qpos), full_path.substr(qpos + 1)};
+}
+
+// --------------------------------------------------------- //
+
+// MIME type mapping for static files
+std::string mime_type(const std::string &ext) {
+    static std::map<std::string, std::string> mime_map = {
+        {"html", "text/html"},
+        {"css", "text/css"},
+        {"js", "application/javascript"},
+        {"json", "application/json"},
+        {"png", "image/png"},
+        {"jpg", "image/jpeg"},
+        {"jpeg", "image/jpeg"},
+        {"gif", "image/gif"},
+        {"svg", "image/svg+xml"},
+        {"webp", "image/webp"},
+        {"mp4", "video/mp4"},
+        {"webm", "video/webm"},
+        {"ogg", "video/ogg"},
+        {"txt", "text/plain"},
+        {"pdf", "application/pdf"}};
+
+    std::string ext_lower = ext;
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(),
+                   ::tolower);
+
+    auto it = mime_map.find(ext_lower);
+    return it != mime_map.end() ? it->second : "application/octet-stream";
+}
+
+// --------------------------------------------------------- //
+
+// Connection state for epoll-based non-blocking I/O
+enum class ConnectionState { READING, WRITING, WEBSOCKET, CLOSING };
+
+struct Connection {
+    int fd;
+    std::string buffer;
+    size_t header_end;
+    ConnectionState state;
+    std::string room_name;
+    std::string pending_response;
+    size_t response_offset;
+
+    Connection()
+        : fd(-1), header_end(0), state(ConnectionState::READING),
+          response_offset(0) {}
+};
+
+// --------------------------------------------------------- //
+
+class HttpServer {
+private:
+    int server_fd;
+    int epoll_fd;
+    int port;
+    std::atomic<bool> running;
+    ThreadPool thread_pool;
+    std::map<int, Connection> connections;
+    std::mutex connections_mutex;
+
+    const std::string home_response = "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: text/plain\r\n"
+                                      "Content-Length: 4\r\n"
+                                      "Connection: keep-alive\r\n"
+                                      "\r\n"
+                                      "home";
+
+    const std::string json_response = "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: application/json\r\n"
+                                      "Content-Length: 60\r\n"
+                                      "Connection: keep-alive\r\n"
+                                      "\r\n"
+                                      "{\"string\":\"string\",\"decimal\":3.14,"
+                                      "\"round\":69,\"boolean\":true}";
+
+    const std::string not_found_response = "HTTP/1.1 404 Not Found\r\n"
+                                           "Content-Type: text/plain\r\n"
+                                           "Content-Length: 9\r\n"
+                                           "Connection: keep-alive\r\n"
+                                           "\r\n"
+                                           "Not Found";
+
+    const std::string forbidden_response = "HTTP/1.1 403 Forbidden\r\n"
+                                           "Content-Type: text/plain\r\n"
+                                           "Content-Length: 9\r\n"
+                                           "Connection: keep-alive\r\n"
+                                           "\r\n"
+                                           "Forbidden";
+
+    const std::string method_not_allowed_response =
+        "HTTP/1.1 405 Method Not Allowed\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 18\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        "Method Not Allowed";
+
+    const std::string bad_request_response = "HTTP/1.1 400 Bad Request\r\n"
+                                             "Content-Type: text/plain\r\n"
+                                             "Content-Length: 11\r\n"
+                                             "Connection: close\r\n"
+                                             "\r\n"
+                                             "Bad Request";
+
+    // --------------------------------------------------------- //
+
+    static bool send_all(int fd, const char *data, size_t len) {
+        while (len > 0) {
+            ssize_t written = write(fd, data, len);
+            if (written <= 0) {
+                if (written == -1 && (errno == EINTR || errno == EAGAIN))
+                    continue;
+                return false;
+            }
+            data += written;
+            len -= written;
+        }
+        return true;
+    }
+
+    // --------------------------------------------------------- //
+
+    std::string join_path_segments(const std::vector<std::string> &segments) {
+        std::string result;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (i > 0)
+                result += "/";
+            result += segments[i];
+        }
+        return result;
+    }
+
+    // --------------------------------------------------------- //
+
+    std::vector<std::string> parse_path_segments(std::string_view path) {
+        std::vector<std::string> segments;
+        size_t start = 4; // after "/cc/"
+
+        while (start < path.length()) {
+            size_t end = path.find('/', start);
+            if (end == std::string_view::npos) {
+                if (start < path.length())
+                    segments.push_back(std::string(path.substr(start)));
+                break;
+            } else {
+                if (start < end)
+                    segments.push_back(
+                        std::string(path.substr(start, end - start)));
+                start = end + 1;
+            }
+        }
+
+        return segments;
+    }
+
+    // --------------------------------------------------------- //
+
+    std::string
+    websocket_handshake_response(const std::string &sec_websocket_key) {
+        std::string accept_key =
+            sec_websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        std::string sha1_hash = SHA1::hash(accept_key);
+        std::string base64_accept = Base64Encoder::encode(sha1_hash);
+
+        return "HTTP/1.1 101 Switching Protocols\r\n"
+               "Upgrade: websocket\r\n"
+               "Connection: Upgrade\r\n"
+               "Sec-WebSocket-Accept: " +
+               base64_accept +
+               "\r\n"
+               "\r\n";
+    }
+
+    // --------------------------------------------------------- //
+
+    // Handle WebSocket connection with room name (like Drogon's websocket
+    // controller)
+    void handle_websocket(int client_fd, const std::string &room_name) {
+        struct SocketCloser {
+            int fd;
+            std::string room;
+
+            explicit SocketCloser(int fd_, const std::string &room_)
+                : fd(fd_), room(room_) {}
+
+            // E.Q.: drogon ws handleConnectionClosed
+            ~SocketCloser() {
+                if (fd != -1) {
+                    // Remove from room connections
+                    {
+                        std::lock_guard<std::mutex> lock(g_rooms_mutex);
+                        auto room_it = g_websocket_rooms.find(room);
+                        if (room_it != g_websocket_rooms.end()) {
+                            auto &connections = room_it->second.connections;
+                            auto before_count = connections.size();
+                            connections.erase(std::remove(connections.begin(),
+                                                          connections.end(),
+                                                          fd),
+                                              connections.end());
+                            auto after_count = connections.size();
+
+                            // Log disconnect with remaining count
+                            if (before_count > after_count) {
+                                std::cout << "WebSocket client disconnected "
+                                             "from room '"
+                                          << room
+                                          << "'. Total in room: " << after_count
+                                          << "\n";
+                            }
+
+                            // Remove room if empty and log
+                            if (connections.empty()) {
+                                g_websocket_rooms.erase(room_it);
+                                std::cout << "Room '" << room
+                                          << "' removed (empty).\n";
+                            }
+                        }
+                    }
+                    close(fd);
+                }
+            }
+
+            SocketCloser(const SocketCloser &) = delete;
+            SocketCloser &operator=(const SocketCloser &) = delete;
+        } closer(client_fd, room_name);
+
+        // E.Q.: drogon ws handleNewConnection
+        {
+            std::lock_guard<std::mutex> lock(g_rooms_mutex);
+            auto &room = g_websocket_rooms[room_name];
+            room.connections.push_back(client_fd);
+            std::cout << "WebSocket client connected to room '" << room_name
+                      << "'. Total in room: " << room.connections.size()
+                      << "\n";
+        }
+
+        char buffer[CLIENT_REQUEST_BUFFER_SIZE];
+        size_t buffer_used = 0;
+
+        // Read WebSocket frames
+        while (true) {
+            if (buffer_used < sizeof(buffer) - 1) {
+                ssize_t bytes_read = read(client_fd, buffer + buffer_used,
+                                          sizeof(buffer) - 1 - buffer_used);
+                if (bytes_read <= 0) {
+                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN))
+                        continue;
+                    return;
+                }
+                buffer_used += bytes_read;
+            }
+
+            // Parse WebSocket frames
+            size_t offset = 0;
+            while (offset < buffer_used) {
+                WebSocketFrame frame;
+                size_t consumed = 0;
+
+                if (!WebSocketFrame::parse(
+                        reinterpret_cast<const uint8_t *>(buffer + offset),
+                        buffer_used - offset, frame, consumed)) {
+                    // Incomplete frame, wait for more data
+                    if (offset == 0 && buffer_used < sizeof(buffer) - 1) {
+                        break;
+                    }
+                    // Malformed frame
+                    WebSocketFrame close_frame =
+                        WebSocketFrame::create_close_frame(1002,
+                                                           "Protocol error");
+                    auto response = close_frame.serialize();
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
+                    return;
+                }
+
+                offset += consumed;
+
+                // Handle different opcodes
+                switch (frame.opcode) {
+                case WebSocketFrame::TEXT:
+                case WebSocketFrame::BINARY: {
+                    // E.Q.: drogon ws handleNewMessage - broadcast to all
+                    // connections in the same room
+                    {
+                        std::lock_guard<std::mutex> lock(g_rooms_mutex);
+                        auto room_it = g_websocket_rooms.find(room_name);
+                        if (room_it != g_websocket_rooms.end()) {
+                            WebSocketFrame broadcast_frame;
+                            broadcast_frame.opcode = frame.opcode;
+                            broadcast_frame.payload = frame.payload;
+                            broadcast_frame.payload_length =
+                                frame.payload_length;
+                            auto response = broadcast_frame.serialize();
+                            for (int conn_fd : room_it->second.connections) {
+                                send_all(conn_fd,
+                                         reinterpret_cast<const char *>(
+                                             response.data()),
+                                         response.size());
+                            }
+                        }
+                    }
+                    break;
+                }
+                case WebSocketFrame::PING: {
+                    // Respond with PONG
+                    WebSocketFrame pong_frame =
+                        WebSocketFrame::create_pong_frame(frame.payload);
+                    auto response = pong_frame.serialize();
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
+                    break;
+                }
+                case WebSocketFrame::PONG: {
+                    // Ignore PONG frames
+                    break;
+                }
+                case WebSocketFrame::CLOSE: {
+                    // Send close frame back and close connection
+                    WebSocketFrame close_frame =
+                        WebSocketFrame::create_close_frame();
+                    auto response = close_frame.serialize();
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
+                    return;
+                }
+                case WebSocketFrame::CONTINUATION:
+                default: {
+                    // Not handling fragmented messages for simplicity
+                    WebSocketFrame close_frame =
+                        WebSocketFrame::create_close_frame(
+                            1003, "Fragmentation not supported");
+                    auto response = close_frame.serialize();
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
+                    return;
+                }
+                }
+            }
+
+            // Remove processed data from buffer
+            if (offset > 0 && offset < buffer_used) {
+                memmove(buffer, buffer + offset, buffer_used - offset);
+                buffer_used -= offset;
+            } else if (offset >= buffer_used) {
+                buffer_used = 0;
+            }
+        }
+    }
+
+    // --------------------------------------------------------- //
+
+    // Attempt to serve a static file from PUBLIC_DIR.
+    // Returns true if a response was sent (200, 403, or 404), false if public
+    // dir missing.
+    bool try_serve_static_file(int client_fd, std::string_view path,
+                               size_t end_of_headers) {
+        (void)end_of_headers; // not used directly, but kept for symmetry with
+                              // Rust version
+
+        std::string decoded_path = percent_decode(path);
+
+        // Remove leading slash
+        if (!decoded_path.empty() && decoded_path[0] == '/') {
+            decoded_path = decoded_path.substr(1);
+        }
+
+        if (decoded_path.empty()) {
+            return false; // let outer code send 404
+        }
+
+        std::string full_path_str =
+            std::string(PUBLIC_DIR) + "/" + decoded_path;
+
+        char public_resolved[PATH_MAX];
+        if (realpath(PUBLIC_DIR, public_resolved) == nullptr) {
+            // Public directory doesn't exist or is inaccessible - cannot
+            // serve static files
+            return false;
+        }
+
+        char file_resolved[PATH_MAX];
+        if (realpath(full_path_str.c_str(), file_resolved) == nullptr) {
+            // File not found
+            send_all(client_fd, not_found_response.data(),
+                     not_found_response.size());
+            return true;
+        }
+
+        // Security: ensure the resolved path stays inside the public directory
+        if (strncmp(file_resolved, public_resolved, strlen(public_resolved)) !=
+            0) {
+            send_all(client_fd, forbidden_response.data(),
+                     forbidden_response.size());
+            return true;
+        }
+
+        struct stat st;
+        if (stat(file_resolved, &st) != 0 || !S_ISREG(st.st_mode)) {
+            send_all(client_fd, not_found_response.data(),
+                     not_found_response.size());
+            return true;
+        }
+
+        std::string ext;
+        size_t dot_pos = decoded_path.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            ext = decoded_path.substr(dot_pos + 1);
+        }
+
+        std::string content_type = mime_type(ext);
+        size_t file_len = st.st_size;
+
+        std::ostringstream header_oss;
+        header_oss << "HTTP/1.1 200 OK\r\n"
+                   << "Content-Type: " << content_type << "\r\n"
+                   << "Content-Length: " << file_len << "\r\n"
+                   << "Connection: keep-alive\r\n"
+                   << "\r\n";
+
+        std::string headers = header_oss.str();
+        if (!send_all(client_fd, headers.data(), headers.size())) {
+            return true; // connection broken, but we already sent headers
+        }
+
+        int file_fd = open(file_resolved, O_RDONLY);
+        if (file_fd == -1) {
+            return true; // file disappeared after stat - abort
+        }
+
+        // Use a simple read/write loop (portable). For Linux, one could use
+        // sendfile.
+        char file_buf[8192];
+        ssize_t bytes_read;
+        while ((bytes_read = read(file_fd, file_buf, sizeof(file_buf))) > 0) {
+            if (!send_all(client_fd, file_buf, bytes_read)) {
+                close(file_fd);
+                return true;
+            }
+        }
+
+        close(file_fd);
+        if (bytes_read == -1) {
+            // read error - connection probably dead
+            return true;
+        }
+
+        return true;
+    }
+
+    // --------------------------------------------------------- //
+
+    std::string extract_header_value(const std::string &headers,
+                                     const std::string &header_name) {
+        size_t pos = headers.find(header_name);
+        if (pos == std::string::npos)
+            return "";
+
+        pos += header_name.length();
+        size_t end = headers.find("\r\n", pos);
+        if (end == std::string::npos)
+            return "";
+
+        std::string value = headers.substr(pos, end - pos);
+        value.erase(0, value.find_first_not_of(" \t:"));
+        value.erase(value.find_last_not_of(" \t") + 1);
+        return value;
+    }
+
+    // --------------------------------------------------------- //
+
+    void handle_http_request(int client_fd, Connection &conn) {
+        std::string_view full_buffer(conn.buffer);
+        size_t end_of_headers = conn.header_end;
+        size_t end_of_line = full_buffer.find("\r\n");
+
+        if (end_of_line == std::string_view::npos ||
+            end_of_line > end_of_headers)
+            return;
+
+        std::string_view request_line = full_buffer.substr(0, end_of_line);
+        size_t first_space = request_line.find(' ');
+        if (first_space == std::string_view::npos) {
+            send_all(client_fd, not_found_response.data(),
+                     not_found_response.size());
+            conn.buffer.clear();
+            conn.header_end = 0;
+            return;
+        }
+
+        std::string_view method = request_line.substr(0, first_space);
+        size_t second_space = request_line.find(' ', first_space + 1);
+        if (second_space == std::string_view::npos ||
+            second_space > end_of_line) {
+            send_all(client_fd, not_found_response.data(),
+                     not_found_response.size());
+            conn.buffer.clear();
+            conn.header_end = 0;
+            return;
+        }
+
+        std::string_view full_path = request_line.substr(
+            first_space + 1, second_space - first_space - 1);
+        auto [path, query] = split_path_query(full_path);
+        auto query_params = parse_query_params(query);
+
+        // WebSocket check with room name (/chat/{room_name})
+        if (method == "GET" && path.substr(0, 6) == "/chat/" &&
+            path.length() > 6) {
+            std::string room_name = std::string(path.substr(6));
+            if (room_name.empty()) {
+                send_all(client_fd, bad_request_response.data(),
+                         bad_request_response.size());
+                return;
+            }
+
+            std::string headers(full_buffer.data(), end_of_headers + 2);
+            std::string upgrade = extract_header_value(headers, "Upgrade:");
+            std::string connection =
+                extract_header_value(headers, "Connection:");
+            std::string sec_websocket_key =
+                extract_header_value(headers, "Sec-WebSocket-Key:");
+
+            if (!upgrade.empty() && !connection.empty() &&
+                !sec_websocket_key.empty()) {
+                bool is_websocket =
+                    (upgrade.find("websocket") != std::string::npos);
+                bool is_upgrade =
+                    (connection.find("Upgrade") != std::string::npos);
+
+                if (is_websocket && is_upgrade) {
+                    std::string handshake_response =
+                        websocket_handshake_response(sec_websocket_key);
+                    send_all(client_fd, handshake_response.c_str(),
+                             handshake_response.length());
+
+                    // Switch to WebSocket mode
+                    conn.state = ConnectionState::WEBSOCKET;
+                    conn.room_name = room_name;
+
+                    // Handle WebSocket in thread pool
+                    thread_pool.enqueue([this, client_fd, room_name]() {
+                        handle_websocket(client_fd, room_name);
+                    });
+                    return;
+                }
+            }
+            // Not a WebSocket request, fall through to normal HTTP
+        }
+
+        const char *response = nullptr;
+        size_t response_len = 0;
+        std::string dynamic_response;
+
+        if (method != "GET") {
+            response = method_not_allowed_response.data();
+            response_len = method_not_allowed_response.size();
+        } else if (path == "/cc") {
+            response = home_response.data();
+            response_len = home_response.size();
+        } else if (path == "/cc/json") {
+            response = json_response.data();
+            response_len = json_response.size();
+        } else if (path == "/cc/echo") {
+            std::string body;
+            if (query_params.empty()) {
+                // No params - return null
+                body = "null";
+            } else {
+                // All params as JSON object
+                std::ostringstream oss;
+                oss << "{";
+                bool first = true;
+                for (const auto &p : query_params) {
+                    if (!first)
+                        oss << ",";
+                    first = false;
+
+                    // Escape JSON special characters in key
+                    std::string escaped_key;
+                    for (char c : p.key) {
+                        switch (c) {
+                        case '"':
+                            escaped_key += "\\\"";
+                            break;
+                        case '\\':
+                            escaped_key += "\\\\";
+                            break;
+                        case '\b':
+                            escaped_key += "\\b";
+                            break;
+                        case '\f':
+                            escaped_key += "\\f";
+                            break;
+                        case '\n':
+                            escaped_key += "\\n";
+                            break;
+                        case '\r':
+                            escaped_key += "\\r";
+                            break;
+                        case '\t':
+                            escaped_key += "\\t";
+                            break;
+                        default:
+                            escaped_key += c;
+                            break;
+                        }
+                    }
+
+                    oss << "\"" << escaped_key << "\":";
+
+                    // Empty value - null, otherwise escaped string
+                    if (p.value.empty()) {
+                        oss << "null";
+                    } else {
+                        oss << "\"";
+                        for (char c : p.value) {
+                            switch (c) {
+                            case '"':
+                                oss << "\\\"";
+                                break;
+                            case '\\':
+                                oss << "\\\\";
+                                break;
+                            case '\b':
+                                oss << "\\b";
+                                break;
+                            case '\f':
+                                oss << "\\f";
+                                break;
+                            case '\n':
+                                oss << "\\n";
+                                break;
+                            case '\r':
+                                oss << "\\r";
+                                break;
+                            case '\t':
+                                oss << "\\t";
+                                break;
+                            default:
+                                oss << c;
+                                break;
+                            }
+                        }
+                        oss << "\"";
+                    }
+                }
+                oss << "}";
+                body = oss.str();
+            }
+
+            std::ostringstream oss;
+            oss << "HTTP/1.1 200 OK\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.length() << "\r\n"
+                << "Connection: keep-alive\r\n"
+                << "\r\n"
+                << body;
+
+            dynamic_response = oss.str();
+            response = dynamic_response.c_str();
+            response_len = dynamic_response.length();
+        } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" &&
+                   path.substr(0, 9) != "/cc/json/") {
+            auto segments = parse_path_segments(path);
+            std::string path_string = join_path_segments(segments);
+            std::string body = segments.empty()
+                                   ? "value path: /cc/"
+                                   : "value path: /cc/" + path_string;
+
+            std::ostringstream oss;
+            oss << "HTTP/1.1 200 OK\r\n"
+                << "Content-Type: text/plain\r\n"
+                << "Content-Length: " << body.length() << "\r\n"
+                << "Connection: keep-alive\r\n"
+                << "\r\n"
+                << body;
+
+            dynamic_response = oss.str();
+            response = dynamic_response.c_str();
+            response_len = dynamic_response.length();
+        } else {
+            // Try to serve static file
+            if (try_serve_static_file(client_fd, path, end_of_headers)) {
+                // Response already sent; shift buffer and continue
+                size_t consumed = end_of_headers + 4;
+                if (consumed < conn.buffer.size()) {
+                    conn.buffer = conn.buffer.substr(consumed);
+                } else {
+                    conn.buffer.clear();
+                }
+                conn.header_end = 0;
+                return;
+            } else {
+                // Public directory missing or not applicable - send 404
+                response = not_found_response.data();
+                response_len = not_found_response.size();
+            }
+        }
+
+        // Send the response (for non-static routes)
+        struct iovec iov;
+        iov.iov_base = const_cast<char *>(response);
+        iov.iov_len = response_len;
+
+        ssize_t written = writev(client_fd, &iov, 1);
+        if (written != static_cast<ssize_t>(response_len)) {
+            if (written == -1 && (errno == EINTR || errno == EAGAIN))
+                writev(client_fd, &iov, 1);
+            return;
+        }
+
+        // Shift buffer for next request (keep-alive)
+        size_t consumed = end_of_headers + 4;
+        if (consumed < conn.buffer.size()) {
+            conn.buffer = conn.buffer.substr(consumed);
+        } else {
+            conn.buffer.clear();
+        }
+        conn.header_end = 0;
+    }
+
+    // --------------------------------------------------------- //
+
+public:
+    HttpServer(int port_num, size_t concurrency_target = 128)
+        : port(port_num), running(true),
+          thread_pool(std::max(std::min(concurrency_target,
+                                        size_t(CONNECTION_CONCURRENT_TARGET)),
+                               size_t(std::thread::hardware_concurrency()))) {
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd == -1) {
+            throw std::runtime_error("socket failed");
+        }
+
+        int opt = 1;
+        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt,
+                       sizeof(opt)) == -1) {
+            close(server_fd);
+            throw std::runtime_error("setsockopt failed");
+        }
+
+        // Create epoll instance
+        epoll_fd = epoll_create1(0);
+        if (epoll_fd == -1) {
+            close(server_fd);
+            throw std::runtime_error("epoll_create1 failed");
+        }
+    }
+
+    ~HttpServer() { stop(); }
+
+    void start() {
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = inet_addr(ADDRESS_IP);
+        address.sin_port = htons(port);
+
+        if (bind(server_fd, (sockaddr *)&address, sizeof(address)) == -1) {
+            throw std::runtime_error("bind failed");
+        }
+
+        if (listen(server_fd, 1024) == -1) {
+            throw std::runtime_error("listen failed");
+        }
+
+        // Set server socket to non-blocking
+        int flags = fcntl(server_fd, F_GETFL, 0);
+        fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
+        // Add server socket to epoll
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = server_fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
+            throw std::runtime_error("epoll_ctl failed");
+        }
+
+        std::cout << "backend_cc_async: run on " << ADDRESS_IP << ":"
+                  << ADDRESS_PORT << "\n";
+        std::cout << "  - HTTP endpoint: /cc\n";
+        std::cout << "  - JSON endpoint: /cc/json\n";
+        std::cout << "  - Echo endpoint: /cc/echo?text=hello (query "
+                     "parameters)\n";
+        std::cout << "  - Dynamic path: /cc/{path1}/{path2}/... (except "
+                     "/cc/json)\n";
+        std::cout << "  - WebSocket endpoint: /chat/{room_name} (per room "
+                     "broadcast)\n";
+        std::cout << "  - Static files from ./public at root (e.g., "
+                     "/image.jpg)\n";
+
+        struct epoll_event events[MAX_EVENTS];
+
+        while (running) {
+            int nfds =
+                epoll_wait(epoll_fd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
+
+            if (nfds == -1) {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+
+            for (int i = 0; i < nfds; i++) {
+                if (events[i].data.fd == server_fd) {
+                    // New connection
+                    sockaddr_in client_addr{};
+                    socklen_t client_len = sizeof(client_addr);
+
+                    int client_fd = accept(server_fd, (sockaddr *)&client_addr,
+                                           &client_len);
+                    if (client_fd == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            continue;
+                        continue;
+                    }
+
+                    // Set client socket to non-blocking
+                    int flag = 1;
+                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag,
+                               sizeof(flag));
+                    flags = fcntl(client_fd, F_GETFL, 0);
+                    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+                    // Add to epoll
+                    ev.events = EPOLLIN | EPOLLET;
+                    ev.data.fd = client_fd;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) ==
+                        -1) {
+                        close(client_fd);
+                        continue;
+                    }
+
+                    // Create connection state
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex);
+                        connections[client_fd] = Connection();
+                        connections[client_fd].fd = client_fd;
+                    }
+                } else {
+                    // Existing connection
+                    int client_fd = events[i].data.fd;
+
+                    if (events[i].events & EPOLLERR ||
+                        events[i].events & EPOLLHUP) {
+                        // Error or hangup
+                        {
+                            std::lock_guard<std::mutex> lock(connections_mutex);
+                            connections.erase(client_fd);
+                        }
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                        close(client_fd);
+                        continue;
+                    }
+
+                    if (events[i].events & EPOLLIN) {
+                        // Readable
+                        {
+                            std::lock_guard<std::mutex> lock(connections_mutex);
+                            auto it = connections.find(client_fd);
+                            if (it == connections.end())
+                                continue;
+
+                            Connection &conn = it->second;
+
+                            // Read data
+                            char buffer[CLIENT_REQUEST_BUFFER_SIZE];
+                            ssize_t bytes_read =
+                                read(client_fd, buffer, sizeof(buffer));
+
+                            if (bytes_read <= 0) {
+                                if (bytes_read == -1 &&
+                                    (errno == EAGAIN || errno == EWOULDBLOCK))
+                                    continue;
+
+                                // Connection closed
+                                connections.erase(it);
+                                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd,
+                                          nullptr);
+                                close(client_fd);
+                                continue;
+                            }
+
+                            conn.buffer.append(buffer, bytes_read);
+
+                            // Check for complete headers
+                            if (conn.state == ConnectionState::READING) {
+                                size_t header_end =
+                                    conn.buffer.find("\r\n\r\n");
+                                if (header_end != std::string::npos) {
+                                    conn.header_end = header_end;
+
+                                    // Process request in thread pool
+                                    thread_pool.enqueue([this, client_fd]() {
+                                        std::lock_guard<std::mutex> lock(
+                                            connections_mutex);
+                                        auto it = connections.find(client_fd);
+                                        if (it != connections.end()) {
+                                            handle_http_request(client_fd,
+                                                                it->second);
+                                        }
+                                    });
+                                }
+                            } else if (conn.state ==
+                                       ConnectionState::WEBSOCKET) {
+                                // WebSocket data handled in dedicated thread
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------- //
+
+    void stop() {
+        if (!running.exchange(false))
+            return;
+
+        // Close all WebSocket connections
+        {
+            std::lock_guard<std::mutex> lock(g_rooms_mutex);
+            for (auto &[_, room] : g_websocket_rooms) {
+                for (int fd : room.connections) {
+                    shutdown(fd, SHUT_RDWR);
+                    close(fd);
+                }
+            }
+            g_websocket_rooms.clear();
+        }
+
+        // Close all client connections
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            for (auto &[fd, conn] : connections) {
+                shutdown(fd, SHUT_RDWR);
+                close(fd);
+            }
+            connections.clear();
+        }
+
+        if (epoll_fd != -1) {
+            close(epoll_fd);
+            epoll_fd = -1;
+        }
+
+        if (server_fd != -1) {
+            shutdown(server_fd, SHUT_RDWR);
+            close(server_fd);
+            server_fd = -1;
+        }
+    }
+};
+
+// --------------------------------------------------------- //
+
+int main() {
+    std::signal(SIGPIPE, SIG_IGN);
+
+    try {
+        HttpServer server(ADDRESS_PORT, CONNECTION_CONCURRENT_TARGET);
+        server.start();
+    } catch (const std::exception &e) {
+        std::cerr << "server error: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+IMPORTANT:
+this implementation result:
+➜ wrk -c 100 -t 6 -d 10s http://localhost:9003/cc
+Running 10s test @ http://localhost:9003/cc
+6 threads and 100 connections
+Thread Stats   Avg      Stdev     Max   +/- Stdev
+Latency     1.18ms  645.14us  46.82ms   98.87%
+Req/Sec    13.76k     1.67k   42.42k    99.17%
+824018 requests in 10.10s, 72.30MB read
+Requests/sec:  81591.02
+Transfer/sec:      7.16MB
+*/
+
