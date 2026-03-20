@@ -21,21 +21,21 @@ function _build_backend_cc() {
         -Wall \
         -Wextra \
         -O3 \
-        -flto \
+        -flto=1 \
         -pthread \
         -march=native;
 }
 
-function _build_backend_cc_drogon() {
-	echo "backend_cc_drogon";
-    g++ backend_cc_drogon/main.cc -o ./backend_cc_drogon.o \
-	-std=c++23 -Wall -Wextra -O3 -pthread -march=native \
-	-I/usr/include -I/usr/local/include -I/mnt/256a1/include \
-	-L/usr/lib -L/usr/local/lib -L/mnt/256a1/lib \
-	-ldrogon -ltrantor -ljsoncpp -luuid -lz -lbrotlienc -lbrotlidec \
-	-lssl -lcrypto -lpq -lmysqlclient -lsqlite3 -lhiredis -lyaml-cpp \
-	-lpthread -ldl -lcares \
-	;
+function _build_backend_cc_async() {
+    echo "backend_cc_async";
+    g++ -o ./backend_cc_async.o ./backend_cc/main_async.cc \
+        -std=c++23 \
+        -Wall \
+        -Wextra \
+        -O3 \
+        -flto=1 \
+        -pthread \
+        -march=native;
 }
 
 # --------------------------------------------------------- #
@@ -84,7 +84,7 @@ function _build_backend_go() {
 function _build_backend_all() {
     _build_backend_c;
     _build_backend_cc;
-    _build_backend_cc_drogon;
+    _build_backend_cc_async;
     _build_backend_rs;
     _build_backend_zig;
     _build_backend_zig_async;
