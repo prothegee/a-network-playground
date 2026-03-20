@@ -1,39 +1,38 @@
-#include <unistd.h>
-#include <fcntl.h>
 #include <arpa/inet.h>
-#include <sys/uio.h>
-#include <sys/time.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/sendfile.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <limits.h>
-
-#include <cstdint>
-#include <iostream>
-#include <string>
-#include <cstring>
-#include <thread>
-#include <atomic>
-#include <vector>
-#include <queue>
-#include <map>
-#include <mutex>
-#include <condition_variable>
-#include <functional>
-#include <csignal>
-#include <cerrno>
-#include <string_view>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
+#include <csignal>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <queue>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 #define ADDRESS_IP "0.0.0.0"
 #define ADDRESS_PORT 9002
 #define CONNECTION_CONCURRENT_TARGET 256
 #define CLIENT_REQUEST_BUFFER_SIZE 8192 // in bytes
-#define PUBLIC_DIR "./public"            // directory for static files
+#define PUBLIC_DIR "./public"           // directory for static files
 
 // --------------------------------------------------------- //
 
@@ -58,15 +57,15 @@ using RoomName = std::string;
 struct WebSocketRoom {
     std::vector<int> connections;
 };
+
 static std::map<RoomName, WebSocketRoom> g_websocket_rooms;
 static std::mutex g_rooms_mutex;
 
 // --------------------------------------------------------- //
+
 class SignalHandler {
 public:
-    SignalHandler() {
-        std::signal(SIGPIPE, SIG_IGN);
-    }
+    SignalHandler() { std::signal(SIGPIPE, SIG_IGN); }
 } sigpipe_handler;
 
 // --------------------------------------------------------- //
@@ -106,8 +105,7 @@ public:
         }
     }
 
-    template<class F>
-    void enqueue(F&& f) {
+    template <class F> void enqueue(F &&f) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             if (stop) {
@@ -153,12 +151,15 @@ public:
     std::array<uint8_t, 4> masking_key;
     std::vector<uint8_t> payload;
 
-    WebSocketFrame() : fin(true), mask(false), opcode(TEXT), payload_length(0) {}
+    WebSocketFrame()
+        : fin(true), mask(false), opcode(TEXT), payload_length(0) {}
 
     // Parse WebSocket frame from buffer (RFC 6455)
-    static bool parse(const uint8_t* data, size_t len, WebSocketFrame& frame, size_t& consumed) {
-        if (len < 2) return false;
-        const uint8_t* ptr = data;
+    static bool parse(const uint8_t *data, size_t len, WebSocketFrame &frame,
+                      size_t &consumed) {
+        if (len < 2)
+            return false;
+        const uint8_t *ptr = data;
 
         // First byte: FIN + RSV + Opcode
         frame.fin = (*ptr & 0x80) != 0;
@@ -172,11 +173,14 @@ public:
 
         // Extended payload length
         if (payload_len_indicator == 126) {
-            if (len < static_cast<size_t>(ptr - data) + 2) return false;
-            frame.payload_length = (static_cast<uint64_t>(ptr[0]) << 8) | ptr[1];
+            if (len < static_cast<size_t>(ptr - data) + 2)
+                return false;
+            frame.payload_length =
+                (static_cast<uint64_t>(ptr[0]) << 8) | ptr[1];
             ptr += 2;
         } else if (payload_len_indicator == 127) {
-            if (len < static_cast<size_t>(ptr - data) + 8) return false;
+            if (len < static_cast<size_t>(ptr - data) + 8)
+                return false;
             frame.payload_length = 0;
             for (int i = 0; i < 8; i++) {
                 frame.payload_length = (frame.payload_length << 8) | ptr[i];
@@ -188,7 +192,8 @@ public:
 
         // Masking key
         if (frame.mask) {
-            if (len < static_cast<size_t>(ptr - data) + 4) return false;
+            if (len < static_cast<size_t>(ptr - data) + 4)
+                return false;
             std::copy(ptr, ptr + 4, frame.masking_key.begin());
             ptr += 4;
         }
@@ -197,7 +202,8 @@ public:
         size_t payload_offset = static_cast<size_t>(ptr - data);
         size_t total_frame_size = payload_offset + frame.payload_length;
 
-        if (len < total_frame_size) return false;
+        if (len < total_frame_size)
+            return false;
 
         frame.payload.resize(frame.payload_length);
         if (frame.payload_length > 0) {
@@ -224,12 +230,14 @@ public:
             buffer.push_back(static_cast<uint8_t>(payload_length));
         } else if (payload_length <= 65535) {
             buffer.push_back(126);
-            buffer.push_back(static_cast<uint8_t>((payload_length >> 8) & 0xFF));
+            buffer.push_back(
+                static_cast<uint8_t>((payload_length >> 8) & 0xFF));
             buffer.push_back(static_cast<uint8_t>(payload_length & 0xFF));
         } else {
             buffer.push_back(127);
             for (int i = 7; i >= 0; i--) {
-                buffer.push_back(static_cast<uint8_t>((payload_length >> (i * 8)) & 0xFF));
+                buffer.push_back(
+                    static_cast<uint8_t>((payload_length >> (i * 8)) & 0xFF));
             }
         }
 
@@ -237,7 +245,7 @@ public:
         return buffer;
     }
 
-    static WebSocketFrame create_text_frame(const std::string& text) {
+    static WebSocketFrame create_text_frame(const std::string &text) {
         WebSocketFrame frame;
         frame.opcode = TEXT;
         frame.payload.assign(text.begin(), text.end());
@@ -245,7 +253,8 @@ public:
         return frame;
     }
 
-    static WebSocketFrame create_pong_frame(const std::vector<uint8_t>& payload = {}) {
+    static WebSocketFrame
+    create_pong_frame(const std::vector<uint8_t> &payload = {}) {
         WebSocketFrame frame;
         frame.opcode = PONG;
         frame.payload = payload;
@@ -253,7 +262,8 @@ public:
         return frame;
     }
 
-    static WebSocketFrame create_close_frame(uint16_t code = 1000, const std::string& reason = "") {
+    static WebSocketFrame create_close_frame(uint16_t code = 1000,
+                                             const std::string &reason = "") {
         WebSocketFrame frame;
         frame.opcode = CLOSE;
         // Close frame payload: 2-byte code + optional reason
@@ -273,8 +283,8 @@ public:
 // Base64 encoding for WebSocket accept key
 class Base64Encoder {
 public:
-    static std::string encode(const std::string& data) {
-        static const char* encoding_table =
+    static std::string encode(const std::string &data) {
+        static const char *encoding_table =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         size_t data_len = data.length();
         size_t output_len = 4 * ((data_len + 2) / 3);
@@ -282,9 +292,12 @@ public:
         size_t i = 0, j = 0;
 
         while (i < data_len) {
-            uint32_t octet_a = i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
-            uint32_t octet_b = i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
-            uint32_t octet_c = i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
+            uint32_t octet_a =
+                i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
+            uint32_t octet_b =
+                i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
+            uint32_t octet_c =
+                i < data_len ? static_cast<uint8_t>(data[i++]) : 0;
             uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
             output[j++] = encoding_table[(triple >> 18) & 0x3F];
             output[j++] = encoding_table[(triple >> 12) & 0x3F];
@@ -310,13 +323,14 @@ private:
     uint64_t count;
     uint8_t buffer[64];
 
-    void transform(const uint8_t* block) {
-        uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
+    void transform(const uint8_t *block) {
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3],
+                 e = state[4];
         uint32_t w[80];
 
         for (int i = 0; i < 16; i++) {
             w[i] = (block[i * 4 + 0] << 24) | (block[i * 4 + 1] << 16) |
-                (block[i * 4 + 2] << 8) | (block[i * 4 + 3]);
+                   (block[i * 4 + 2] << 8) | (block[i * 4 + 3]);
         }
 
         for (int i = 16; i < 80; i++) {
@@ -357,9 +371,7 @@ private:
     }
 
 public:
-    SHA1() {
-        reset();
-    }
+    SHA1() { reset(); }
 
     void reset() {
         state[0] = 0x67452301;
@@ -370,7 +382,7 @@ public:
         count = 0;
     }
 
-    void update(const uint8_t* data, size_t len) {
+    void update(const uint8_t *data, size_t len) {
         for (size_t i = 0; i < len; i++) {
             buffer[count % 64] = data[i];
             count++;
@@ -380,10 +392,11 @@ public:
         }
     }
 
-    void finalize(uint8_t* digest) {
+    void finalize(uint8_t *digest) {
         uint8_t padding[64];
         size_t padding_len = 64 - (count % 64);
-        if (padding_len < 9) padding_len += 64;
+        if (padding_len < 9)
+            padding_len += 64;
 
         padding[0] = 0x80;
         for (size_t i = 1; i < padding_len - 8; i++) {
@@ -405,12 +418,13 @@ public:
         }
     }
 
-    static std::string hash(const std::string& input) {
+    static std::string hash(const std::string &input) {
         SHA1 sha1;
-        sha1.update(reinterpret_cast<const uint8_t*>(input.data()), input.length());
+        sha1.update(reinterpret_cast<const uint8_t *>(input.data()),
+                    input.length());
         uint8_t digest[20];
         sha1.finalize(digest);
-        return std::string(reinterpret_cast<char*>(digest), 20);
+        return std::string(reinterpret_cast<char *>(digest), 20);
     }
 };
 
@@ -428,7 +442,7 @@ std::string percent_decode(std::string_view input) {
     for (size_t i = 0; i < input.size(); ++i) {
         if (input[i] == '%' && i + 2 < input.size()) {
             int hex_val;
-            std::istringstream iss(std::string(input.substr(i+1, 2)));
+            std::istringstream iss(std::string(input.substr(i + 1, 2)));
             if (iss >> std::hex >> hex_val) {
                 result.push_back(static_cast<char>(hex_val));
                 i += 2;
@@ -446,12 +460,14 @@ std::string percent_decode(std::string_view input) {
 
 std::vector<QueryParam> parse_query_params(std::string_view query) {
     std::vector<QueryParam> params;
-    if (query.empty()) return params;
+    if (query.empty())
+        return params;
 
     size_t pos = 0;
     while (pos < query.size()) {
         size_t amp_pos = query.find('&', pos);
-        if (amp_pos == std::string_view::npos) amp_pos = query.size();
+        if (amp_pos == std::string_view::npos)
+            amp_pos = query.size();
 
         std::string_view pair = query.substr(pos, amp_pos - pos);
         size_t eq_pos = pair.find('=');
@@ -468,7 +484,8 @@ std::vector<QueryParam> parse_query_params(std::string_view query) {
     return params;
 }
 
-std::pair<std::string_view, std::string_view> split_path_query(std::string_view full_path) {
+std::pair<std::string_view, std::string_view>
+split_path_query(std::string_view full_path) {
     size_t qpos = full_path.find('?');
     if (qpos == std::string_view::npos) {
         return {full_path, {}};
@@ -479,7 +496,7 @@ std::pair<std::string_view, std::string_view> split_path_query(std::string_view 
 // --------------------------------------------------------- //
 
 // MIME type mapping for static files
-std::string mime_type(const std::string& ext) {
+std::string mime_type(const std::string &ext) {
     static std::map<std::string, std::string> mime_map = {
         {"html", "text/html"},
         {"css", "text/css"},
@@ -495,10 +512,10 @@ std::string mime_type(const std::string& ext) {
         {"webm", "video/webm"},
         {"ogg", "video/ogg"},
         {"txt", "text/plain"},
-        {"pdf", "application/pdf"}
-    };
+        {"pdf", "application/pdf"}};
     std::string ext_lower = ext;
-    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(),
+                   ::tolower);
     auto it = mime_map.find(ext_lower);
     return it != mime_map.end() ? it->second : "application/octet-stream";
 }
@@ -512,38 +529,35 @@ private:
     std::atomic<bool> running;
     ThreadPool thread_pool;
 
-    const std::string home_response =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 4\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n"
-        "home";
-    
-    const std::string json_response =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: 60\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n"
-        "{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}";
-    
-    const std::string not_found_response =
-        "HTTP/1.1 404 Not Found\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 9\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n"
-        "Not Found";
-    
-    const std::string forbidden_response =
-        "HTTP/1.1 403 Forbidden\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 9\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n"
-        "Forbidden";
-    
+    const std::string home_response = "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: text/plain\r\n"
+                                      "Content-Length: 4\r\n"
+                                      "Connection: keep-alive\r\n"
+                                      "\r\n"
+                                      "home";
+
+    const std::string json_response = "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: application/json\r\n"
+                                      "Content-Length: 60\r\n"
+                                      "Connection: keep-alive\r\n"
+                                      "\r\n"
+                                      "{\"string\":\"string\",\"decimal\":3.14,"
+                                      "\"round\":69,\"boolean\":true}";
+
+    const std::string not_found_response = "HTTP/1.1 404 Not Found\r\n"
+                                           "Content-Type: text/plain\r\n"
+                                           "Content-Length: 9\r\n"
+                                           "Connection: keep-alive\r\n"
+                                           "\r\n"
+                                           "Not Found";
+
+    const std::string forbidden_response = "HTTP/1.1 403 Forbidden\r\n"
+                                           "Content-Type: text/plain\r\n"
+                                           "Content-Length: 9\r\n"
+                                           "Connection: keep-alive\r\n"
+                                           "\r\n"
+                                           "Forbidden";
+
     const std::string method_not_allowed_response =
         "HTTP/1.1 405 Method Not Allowed\r\n"
         "Content-Type: text/plain\r\n"
@@ -551,20 +565,20 @@ private:
         "Connection: keep-alive\r\n"
         "\r\n"
         "Method Not Allowed";
-    
-    const std::string bad_request_response =
-        "HTTP/1.1 400 Bad Request\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 11\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Bad Request";
 
-    static bool send_all(int fd, const char* data, size_t len) {
+    const std::string bad_request_response = "HTTP/1.1 400 Bad Request\r\n"
+                                             "Content-Type: text/plain\r\n"
+                                             "Content-Length: 11\r\n"
+                                             "Connection: close\r\n"
+                                             "\r\n"
+                                             "Bad Request";
+
+    static bool send_all(int fd, const char *data, size_t len) {
         while (len > 0) {
             ssize_t written = write(fd, data, len);
             if (written <= 0) {
-                if (written == -1 && (errno == EINTR || errno == EAGAIN)) continue;
+                if (written == -1 && (errno == EINTR || errno == EAGAIN))
+                    continue;
                 return false;
             }
             data += written;
@@ -573,10 +587,11 @@ private:
         return true;
     }
 
-    std::string join_path_segments(const std::vector<std::string>& segments) {
+    std::string join_path_segments(const std::vector<std::string> &segments) {
         std::string result;
         for (size_t i = 0; i < segments.size(); ++i) {
-            if (i > 0) result += "/";
+            if (i > 0)
+                result += "/";
             result += segments[i];
         }
         return result;
@@ -593,30 +608,37 @@ private:
                 break;
             } else {
                 if (start < end)
-                    segments.push_back(std::string(path.substr(start, end - start)));
+                    segments.push_back(
+                        std::string(path.substr(start, end - start)));
                 start = end + 1;
             }
         }
         return segments;
     }
 
-    std::string websocket_handshake_response(const std::string& sec_websocket_key) {
-        std::string accept_key = sec_websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::string
+    websocket_handshake_response(const std::string &sec_websocket_key) {
+        std::string accept_key =
+            sec_websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         std::string sha1_hash = SHA1::hash(accept_key);
         std::string base64_accept = Base64Encoder::encode(sha1_hash);
         return "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: " + base64_accept + "\r\n"
-            "\r\n";
+               "Upgrade: websocket\r\n"
+               "Connection: Upgrade\r\n"
+               "Sec-WebSocket-Accept: " +
+               base64_accept +
+               "\r\n"
+               "\r\n";
     }
 
-    // Handle WebSocket connection with room name (like Drogon's websocket controller)
-    void handle_websocket(int client_fd, const std::string& room_name) {
+    // Handle WebSocket connection with room name (like Drogon's websocket
+    // controller)
+    void handle_websocket(int client_fd, const std::string &room_name) {
         struct SocketCloser {
             int fd;
             std::string room;
-            explicit SocketCloser(int fd_, const std::string& room_) : fd(fd_), room(room_) {}
+            explicit SocketCloser(int fd_, const std::string &room_)
+                : fd(fd_), room(room_) {}
             // E.Q.: drogon ws handleConnectionClosed
             ~SocketCloser() {
                 if (fd != -1) {
@@ -625,24 +647,28 @@ private:
                         std::lock_guard<std::mutex> lock(g_rooms_mutex);
                         auto room_it = g_websocket_rooms.find(room);
                         if (room_it != g_websocket_rooms.end()) {
-                            auto& connections = room_it->second.connections;
+                            auto &connections = room_it->second.connections;
                             auto before_count = connections.size();
-                            connections.erase(
-                                std::remove(connections.begin(), connections.end(), fd),
-                                connections.end()
-                            );
+                            connections.erase(std::remove(connections.begin(),
+                                                          connections.end(),
+                                                          fd),
+                                              connections.end());
                             auto after_count = connections.size();
-                            
+
                             // Log disconnect with remaining count
                             if (before_count > after_count) {
-                                std::cout << "WebSocket client disconnected from room '" << room << "'. Total in room: " 
-                                          << after_count << "\n";
+                                std::cout << "WebSocket client disconnected "
+                                             "from room '"
+                                          << room
+                                          << "'. Total in room: " << after_count
+                                          << "\n";
                             }
-                            
+
                             // Remove room if empty and log
                             if (connections.empty()) {
                                 g_websocket_rooms.erase(room_it);
-                                std::cout << "Room '" << room << "' removed (empty).\n";
+                                std::cout << "Room '" << room
+                                          << "' removed (empty).\n";
                             }
                         }
                     }
@@ -650,17 +676,18 @@ private:
                 }
             }
 
-            SocketCloser(const SocketCloser&) = delete;
-            SocketCloser& operator=(const SocketCloser&) = delete;
+            SocketCloser(const SocketCloser &) = delete;
+            SocketCloser &operator=(const SocketCloser &) = delete;
         } closer(client_fd, room_name);
 
         // E.Q.: drogon ws handleNewConnection
         {
             std::lock_guard<std::mutex> lock(g_rooms_mutex);
-            auto& room = g_websocket_rooms[room_name];
+            auto &room = g_websocket_rooms[room_name];
             room.connections.push_back(client_fd);
-            std::cout << "WebSocket client connected to room '" << room_name << "'. Total in room: " 
-                      << room.connections.size() << "\n";
+            std::cout << "WebSocket client connected to room '" << room_name
+                      << "'. Total in room: " << room.connections.size()
+                      << "\n";
         }
 
         char buffer[CLIENT_REQUEST_BUFFER_SIZE];
@@ -669,9 +696,11 @@ private:
         // Read WebSocket frames
         while (true) {
             if (buffer_used < sizeof(buffer) - 1) {
-                ssize_t bytes_read = read(client_fd, buffer + buffer_used, sizeof(buffer) - 1 - buffer_used);
+                ssize_t bytes_read = read(client_fd, buffer + buffer_used,
+                                          sizeof(buffer) - 1 - buffer_used);
                 if (bytes_read <= 0) {
-                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN)) continue;
+                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN))
+                        continue;
                     return;
                 }
                 buffer_used += bytes_read;
@@ -683,16 +712,21 @@ private:
                 WebSocketFrame frame;
                 size_t consumed = 0;
 
-                if (!WebSocketFrame::parse(reinterpret_cast<const uint8_t*>(buffer + offset),
-                    buffer_used - offset, frame, consumed)) {
+                if (!WebSocketFrame::parse(
+                        reinterpret_cast<const uint8_t *>(buffer + offset),
+                        buffer_used - offset, frame, consumed)) {
                     // Incomplete frame, wait for more data
                     if (offset == 0 && buffer_used < sizeof(buffer) - 1) {
                         break;
                     }
                     // Malformed frame
-                    WebSocketFrame close_frame = WebSocketFrame::create_close_frame(1002, "Protocol error");
+                    WebSocketFrame close_frame =
+                        WebSocketFrame::create_close_frame(1002,
+                                                           "Protocol error");
                     auto response = close_frame.serialize();
-                    send_all(client_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
                     return;
                 }
 
@@ -701,7 +735,8 @@ private:
                 switch (frame.opcode) {
                 case WebSocketFrame::TEXT:
                 case WebSocketFrame::BINARY: {
-                    // E.Q.: drogon ws handleNewMessage - broadcast to all connections in the same room
+                    // E.Q.: drogon ws handleNewMessage - broadcast to all
+                    // connections in the same room
                     {
                         std::lock_guard<std::mutex> lock(g_rooms_mutex);
                         auto room_it = g_websocket_rooms.find(room_name);
@@ -709,11 +744,15 @@ private:
                             WebSocketFrame broadcast_frame;
                             broadcast_frame.opcode = frame.opcode;
                             broadcast_frame.payload = frame.payload;
-                            broadcast_frame.payload_length = frame.payload_length;
+                            broadcast_frame.payload_length =
+                                frame.payload_length;
                             auto response = broadcast_frame.serialize();
-                            
+
                             for (int conn_fd : room_it->second.connections) {
-                                send_all(conn_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                                send_all(conn_fd,
+                                         reinterpret_cast<const char *>(
+                                             response.data()),
+                                         response.size());
                             }
                         }
                     }
@@ -722,9 +761,12 @@ private:
 
                 case WebSocketFrame::PING: {
                     // Respond with PONG
-                    WebSocketFrame pong_frame = WebSocketFrame::create_pong_frame(frame.payload);
+                    WebSocketFrame pong_frame =
+                        WebSocketFrame::create_pong_frame(frame.payload);
                     auto response = pong_frame.serialize();
-                    send_all(client_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
                     break;
                 }
 
@@ -735,18 +777,25 @@ private:
 
                 case WebSocketFrame::CLOSE: {
                     // Send close frame back and close connection
-                    WebSocketFrame close_frame = WebSocketFrame::create_close_frame();
+                    WebSocketFrame close_frame =
+                        WebSocketFrame::create_close_frame();
                     auto response = close_frame.serialize();
-                    send_all(client_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
                     return;
                 }
 
                 case WebSocketFrame::CONTINUATION:
                 default: {
                     // Not handling fragmented messages for simplicity
-                    WebSocketFrame close_frame = WebSocketFrame::create_close_frame(1003, "Fragmentation not supported");
+                    WebSocketFrame close_frame =
+                        WebSocketFrame::create_close_frame(
+                            1003, "Fragmentation not supported");
                     auto response = close_frame.serialize();
-                    send_all(client_fd, reinterpret_cast<const char*>(response.data()), response.size());
+                    send_all(client_fd,
+                             reinterpret_cast<const char *>(response.data()),
+                             response.size());
                     return;
                 }
                 }
@@ -763,9 +812,12 @@ private:
     }
 
     // Attempt to serve a static file from PUBLIC_DIR.
-    // Returns true if a response was sent (200, 403, or 404), false if public dir missing.
-    bool try_serve_static_file(int client_fd, std::string_view path, size_t end_of_headers) {
-        (void)end_of_headers; // not used directly, but kept for symmetry with Rust version
+    // Returns true if a response was sent (200, 403, or 404), false if public
+    // dir missing.
+    bool try_serve_static_file(int client_fd, std::string_view path,
+                               size_t end_of_headers) {
+        (void)end_of_headers; // not used directly, but kept for symmetry with
+                              // Rust version
         std::string decoded_path = percent_decode(path);
         // Remove leading slash
         if (!decoded_path.empty() && decoded_path[0] == '/') {
@@ -775,30 +827,36 @@ private:
             return false; // let outer code send 404
         }
 
-        std::string full_path_str = std::string(PUBLIC_DIR) + "/" + decoded_path;
+        std::string full_path_str =
+            std::string(PUBLIC_DIR) + "/" + decoded_path;
 
         char public_resolved[PATH_MAX];
         if (realpath(PUBLIC_DIR, public_resolved) == nullptr) {
-            // Public directory doesn't exist or is inaccessible – cannot serve static files
+            // Public directory doesn't exist or is inaccessible – cannot serve
+            // static files
             return false;
         }
 
         char file_resolved[PATH_MAX];
         if (realpath(full_path_str.c_str(), file_resolved) == nullptr) {
             // File not found
-            send_all(client_fd, not_found_response.data(), not_found_response.size());
+            send_all(client_fd, not_found_response.data(),
+                     not_found_response.size());
             return true;
         }
 
         // Security: ensure the resolved path stays inside the public directory
-        if (strncmp(file_resolved, public_resolved, strlen(public_resolved)) != 0) {
-            send_all(client_fd, forbidden_response.data(), forbidden_response.size());
+        if (strncmp(file_resolved, public_resolved, strlen(public_resolved)) !=
+            0) {
+            send_all(client_fd, forbidden_response.data(),
+                     forbidden_response.size());
             return true;
         }
 
         struct stat st;
         if (stat(file_resolved, &st) != 0 || !S_ISREG(st.st_mode)) {
-            send_all(client_fd, not_found_response.data(), not_found_response.size());
+            send_all(client_fd, not_found_response.data(),
+                     not_found_response.size());
             return true;
         }
 
@@ -826,7 +884,8 @@ private:
             return true; // file disappeared after stat – abort
         }
 
-        // Use a simple read/write loop (portable). For Linux, one could use sendfile.
+        // Use a simple read/write loop (portable). For Linux, one could use
+        // sendfile.
         char file_buf[8192];
         ssize_t bytes_read;
         while ((bytes_read = read(file_fd, file_buf, sizeof(file_buf))) > 0) {
@@ -847,14 +906,16 @@ private:
 public:
     HttpServer(int port_num, size_t concurrency_target = 128)
         : port(port_num), running(true),
-          thread_pool(std::max(std::min(concurrency_target, size_t(CONNECTION_CONCURRENT_TARGET)),
+          thread_pool(std::max(std::min(concurrency_target,
+                                        size_t(CONNECTION_CONCURRENT_TARGET)),
                                size_t(std::thread::hardware_concurrency()))) {
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd == -1) {
             throw std::runtime_error("socket failed");
         }
         int opt = 1;
-        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt,
+                       sizeof(opt)) == -1) {
             close(server_fd);
             throw std::runtime_error("setsockopt failed");
         }
@@ -868,44 +929,56 @@ public:
         address.sin_addr.s_addr = inet_addr(ADDRESS_IP);
         address.sin_port = htons(port);
 
-        if (bind(server_fd, (sockaddr*)&address, sizeof(address)) == -1) {
+        if (bind(server_fd, (sockaddr *)&address, sizeof(address)) == -1) {
             throw std::runtime_error("bind failed");
         }
         if (listen(server_fd, 1024) == -1) {
             throw std::runtime_error("listen failed");
         }
 
-        std::cout << "backend_cc: run on " << ADDRESS_IP << ":" << ADDRESS_PORT << "\n";
+        std::cout << "backend_cc: run on " << ADDRESS_IP << ":" << ADDRESS_PORT
+                  << "\n";
         std::cout << "  - HTTP endpoint: /cc\n";
         std::cout << "  - JSON endpoint: /cc/json\n";
-        std::cout << "  - Echo endpoint: /cc/echo?text=hello (query parameters)\n";
-        std::cout << "  - Dynamic path: /cc/{path1}/{path2}/... (except /cc/json)\n";
-        std::cout << "  - WebSocket endpoint: /chat/{room_name} (per room broadcast)\n";
-        std::cout << "  - Static files from ./public at root (e.g., /image.jpg)\n";
+        std::cout
+            << "  - Echo endpoint: /cc/echo?text=hello (query parameters)\n";
+        std::cout
+            << "  - Dynamic path: /cc/{path1}/{path2}/... (except /cc/json)\n";
+        std::cout << "  - WebSocket endpoint: /chat/{room_name} (per room "
+                     "broadcast)\n";
+        std::cout
+            << "  - Static files from ./public at root (e.g., /image.jpg)\n";
 
         while (running) {
             sockaddr_in client_addr{};
             socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_len);
+            int client_fd =
+                accept(server_fd, (sockaddr *)&client_addr, &client_len);
             if (client_fd == -1) {
-                if (!running) break;
+                if (!running)
+                    break;
                 continue;
             }
             int flag = 1;
-            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag,
+                       sizeof(flag));
             thread_pool.enqueue([this, client_fd]() {
-                try { handle_client(client_fd); }
-                catch (...) { close(client_fd); }
+                try {
+                    handle_client(client_fd);
+                } catch (...) {
+                    close(client_fd);
+                }
             });
         }
     }
 
     void stop() {
-        if (!running.exchange(false)) return;
+        if (!running.exchange(false))
+            return;
         // Close all WebSocket connections
         {
             std::lock_guard<std::mutex> lock(g_rooms_mutex);
-            for (auto& [_, room] : g_websocket_rooms) {
+            for (auto &[_, room] : g_websocket_rooms) {
                 for (int fd : room.connections) {
                     shutdown(fd, SHUT_RDWR);
                     close(fd);
@@ -921,12 +994,15 @@ public:
     }
 
 private:
-    std::string extract_header_value(const std::string& headers, const std::string& header_name) {
+    std::string extract_header_value(const std::string &headers,
+                                     const std::string &header_name) {
         size_t pos = headers.find(header_name);
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            return "";
         pos += header_name.length();
         size_t end = headers.find("\r\n", pos);
-        if (end == std::string::npos) return "";
+        if (end == std::string::npos)
+            return "";
         std::string value = headers.substr(pos, end - pos);
         value.erase(0, value.find_first_not_of(" \t:"));
         value.erase(value.find_last_not_of(" \t") + 1);
@@ -934,16 +1010,25 @@ private:
     }
 
     void handle_client(int client_fd) {
-        struct SocketCloser { int fd; explicit SocketCloser(int fd_) : fd(fd_) {} ~SocketCloser() { if (fd != -1) close(fd); } } closer(client_fd);
+        struct SocketCloser {
+            int fd;
+            explicit SocketCloser(int fd_) : fd(fd_) {}
+            ~SocketCloser() {
+                if (fd != -1)
+                    close(fd);
+            }
+        } closer(client_fd);
 
         char buffer[CLIENT_REQUEST_BUFFER_SIZE];
         size_t buffer_used = 0;
 
         while (true) {
             if (buffer_used < sizeof(buffer) - 1) {
-                ssize_t bytes_read = read(client_fd, buffer + buffer_used, sizeof(buffer) - 1 - buffer_used);
+                ssize_t bytes_read = read(client_fd, buffer + buffer_used,
+                                          sizeof(buffer) - 1 - buffer_used);
                 if (bytes_read <= 0) {
-                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN)) continue;
+                    if (bytes_read == -1 && (errno == EINTR || errno == EAGAIN))
+                        continue;
                     return;
                 }
                 buffer_used += bytes_read;
@@ -953,57 +1038,76 @@ private:
             std::string_view full_buffer(buffer, buffer_used);
             size_t end_of_headers = full_buffer.find("\r\n\r\n");
             if (end_of_headers == std::string_view::npos) {
-                if (buffer_used >= sizeof(buffer) - 1) return;
+                if (buffer_used >= sizeof(buffer) - 1)
+                    return;
                 continue;
             }
 
             size_t end_of_line = full_buffer.find("\r\n");
-            if (end_of_line == std::string_view::npos || end_of_line > end_of_headers) return;
+            if (end_of_line == std::string_view::npos ||
+                end_of_line > end_of_headers)
+                return;
 
             std::string_view request_line = full_buffer.substr(0, end_of_line);
             size_t first_space = request_line.find(' ');
             if (first_space == std::string_view::npos) {
-                send_all(client_fd, not_found_response.data(), not_found_response.size());
-                buffer_used = 0; continue;
+                send_all(client_fd, not_found_response.data(),
+                         not_found_response.size());
+                buffer_used = 0;
+                continue;
             }
 
             std::string_view method = request_line.substr(0, first_space);
             size_t second_space = request_line.find(' ', first_space + 1);
-            if (second_space == std::string_view::npos || second_space > end_of_line) {
-                send_all(client_fd, not_found_response.data(), not_found_response.size());
-                buffer_used = 0; continue;
+            if (second_space == std::string_view::npos ||
+                second_space > end_of_line) {
+                send_all(client_fd, not_found_response.data(),
+                         not_found_response.size());
+                buffer_used = 0;
+                continue;
             }
 
-            std::string_view full_path = request_line.substr(first_space + 1, second_space - first_space - 1);
+            std::string_view full_path = request_line.substr(
+                first_space + 1, second_space - first_space - 1);
             auto [path, query] = split_path_query(full_path);
             auto query_params = parse_query_params(query);
 
             // WebSocket check with room name (/chat/{room_name})
-            if (method == "GET" && path.substr(0, 6) == "/chat/" && path.length() > 6) {
+            if (method == "GET" && path.substr(0, 6) == "/chat/" &&
+                path.length() > 6) {
                 std::string room_name = std::string(path.substr(6));
                 if (room_name.empty()) {
-                    send_all(client_fd, bad_request_response.data(), bad_request_response.size());
+                    send_all(client_fd, bad_request_response.data(),
+                             bad_request_response.size());
                     return;
                 }
                 std::string headers(full_buffer.data(), end_of_headers + 2);
                 std::string upgrade = extract_header_value(headers, "Upgrade:");
-                std::string connection = extract_header_value(headers, "Connection:");
-                std::string sec_websocket_key = extract_header_value(headers, "Sec-WebSocket-Key:");
+                std::string connection =
+                    extract_header_value(headers, "Connection:");
+                std::string sec_websocket_key =
+                    extract_header_value(headers, "Sec-WebSocket-Key:");
 
-                if (!upgrade.empty() && !connection.empty() && !sec_websocket_key.empty()) {
-                    bool is_websocket = (upgrade.find("websocket") != std::string::npos);
-                    bool is_upgrade = (connection.find("Upgrade") != std::string::npos);
+                if (!upgrade.empty() && !connection.empty() &&
+                    !sec_websocket_key.empty()) {
+                    bool is_websocket =
+                        (upgrade.find("websocket") != std::string::npos);
+                    bool is_upgrade =
+                        (connection.find("Upgrade") != std::string::npos);
                     if (is_websocket && is_upgrade) {
-                        std::string handshake_response = websocket_handshake_response(sec_websocket_key);
-                        send_all(client_fd, handshake_response.c_str(), handshake_response.length());
+                        std::string handshake_response =
+                            websocket_handshake_response(sec_websocket_key);
+                        send_all(client_fd, handshake_response.c_str(),
+                                 handshake_response.length());
                         handle_websocket(client_fd, room_name);
                         return;
                     }
                 }
-                // Not a WebSocket request, fall through to normal HTTP (will be handled below)
+                // Not a WebSocket request, fall through to normal HTTP (will be
+                // handled below)
             }
 
-            const char* response = nullptr;
+            const char *response = nullptr;
             size_t response_len = 0;
             std::string dynamic_response;
 
@@ -1018,20 +1122,87 @@ private:
                 response_len = json_response.size();
             } else if (path == "/cc/echo") {
                 std::string body;
-                bool found_text = false;
-                for (const auto& p : query_params) {
-                    if (p.key == "text") {
-                        body = "Echo: " + p.value;
-                        found_text = true;
-                        break;
-                    }
-                }
-                if (!found_text) {
+                if (query_params.empty()) {
+                    // No params → return null
+                    body = "null";
+                } else {
+                    // All params as JSON object
                     std::ostringstream oss;
                     oss << "{";
-                    for (size_t i = 0; i < query_params.size(); ++i) {
-                        if (i > 0) oss << ",";
-                        oss << "\"" << query_params[i].key << "\":\"" << query_params[i].value << "\"";
+                    bool first = true;
+                    for (const auto &p : query_params) {
+                        if (!first)
+                            oss << ",";
+                        first = false;
+
+                        // Escape JSON special characters in key
+                        std::string escaped_key;
+                        for (char c : p.key) {
+                            switch (c) {
+                            case '"':
+                                escaped_key += "\\\"";
+                                break;
+                            case '\\':
+                                escaped_key += "\\\\";
+                                break;
+                            case '\b':
+                                escaped_key += "\\b";
+                                break;
+                            case '\f':
+                                escaped_key += "\\f";
+                                break;
+                            case '\n':
+                                escaped_key += "\\n";
+                                break;
+                            case '\r':
+                                escaped_key += "\\r";
+                                break;
+                            case '\t':
+                                escaped_key += "\\t";
+                                break;
+                            default:
+                                escaped_key += c;
+                                break;
+                            }
+                        }
+
+                        oss << "\"" << escaped_key << "\":";
+
+                        // Empty value → null, otherwise escaped string
+                        if (p.value.empty()) {
+                            oss << "null";
+                        } else {
+                            oss << "\"";
+                            for (char c : p.value) {
+                                switch (c) {
+                                case '"':
+                                    oss << "\\\"";
+                                    break;
+                                case '\\':
+                                    oss << "\\\\";
+                                    break;
+                                case '\b':
+                                    oss << "\\b";
+                                    break;
+                                case '\f':
+                                    oss << "\\f";
+                                    break;
+                                case '\n':
+                                    oss << "\\n";
+                                    break;
+                                case '\r':
+                                    oss << "\\r";
+                                    break;
+                                case '\t':
+                                    oss << "\\t";
+                                    break;
+                                default:
+                                    oss << c;
+                                    break;
+                                }
+                            }
+                            oss << "\"";
+                        }
                     }
                     oss << "}";
                     body = oss.str();
@@ -1046,10 +1217,13 @@ private:
                 dynamic_response = oss.str();
                 response = dynamic_response.c_str();
                 response_len = dynamic_response.length();
-            } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" && path.substr(0, 9) != "/cc/json/") {
+            } else if (path.substr(0, 4) == "/cc/" && path != "/cc/json" &&
+                       path.substr(0, 9) != "/cc/json/") {
                 auto segments = parse_path_segments(path);
                 std::string path_string = join_path_segments(segments);
-                std::string body = segments.empty() ? "value path: /cc/" : "value path: /cc/" + path_string;
+                std::string body = segments.empty()
+                                       ? "value path: /cc/"
+                                       : "value path: /cc/" + path_string;
                 std::ostringstream oss;
                 oss << "HTTP/1.1 200 OK\r\n"
                     << "Content-Type: text/plain\r\n"
@@ -1066,7 +1240,8 @@ private:
                     // Response already sent; shift buffer and continue
                     size_t consumed = end_of_headers + 4;
                     if (consumed < buffer_used) {
-                        memmove(buffer, buffer + consumed, buffer_used - consumed);
+                        memmove(buffer, buffer + consumed,
+                                buffer_used - consumed);
                         buffer_used -= consumed;
                     } else {
                         buffer_used = 0;
@@ -1081,7 +1256,7 @@ private:
 
             // Send the response (for non‑static routes)
             struct iovec iov;
-            iov.iov_base = const_cast<char*>(response);
+            iov.iov_base = const_cast<char *>(response);
             iov.iov_len = response_len;
             ssize_t written = writev(client_fd, &iov, 1);
             if (written != static_cast<ssize_t>(response_len)) {
@@ -1103,12 +1278,13 @@ private:
 };
 
 // --------------------------------------------------------- //
+
 int main() {
     std::signal(SIGPIPE, SIG_IGN);
     try {
         HttpServer server(ADDRESS_PORT, CONNECTION_CONCURRENT_TARGET);
         server.start();
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         std::cerr << "server error: " << e.what() << "\n";
         return 1;
     }
