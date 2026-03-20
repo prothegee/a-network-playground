@@ -1,0 +1,15 @@
+IndentWidth: 4
+AccessModifierOffset: -4
+IndentAccessModifiers: false
+BreakBeforeBraces: Attach
+AlignAfterOpenBracket: Align
+BinPackParameters: true
+AllowAllParametersOfDeclarationOnNextLine: false
+PointerAlignment: Right
+ReferenceAlignment: Right
+ColumnLimit: 80
+# MaxEmptyLinesToKeep: 3
+SeparateDefinitionBlocks: Leave # Leave,Always
+RemoveEmptyLinesInUnwrappedLines: false
+KeepEmptyLinesAtEOF: true
+

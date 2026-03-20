@@ -1,0 +1,13 @@
+max_width = 80
+hard_tabs = false
+tab_spaces = 4
+# brace_style = "PreferSameLine"
+# fn_args_layout = "Compressed" # deprecated
+fn_params_layout = "Compressed"
+# align_after_open_bracket = true # required nightly
+# control_brace_style = "AlwaysSameLine"
+# comment_width = 80
+# empty_item_single_line = true
+# format_macro_matchers = false # required nightly
+# fn_sig_newline = "Never" # reqeuired nightly
+
