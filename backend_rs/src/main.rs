@@ -1,12 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, Mutex};
-use std::thread;
 use std::fs::{self, File};
 use std::io::copy;
-use std::path::{Path};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+};
+use std::thread;
 
 const ADDRESS_IP: &str = "0.0.0.0";
 const ADDRESS_PORT: u16 = 9005;
@@ -152,7 +155,8 @@ impl Sha1 {
 // Base64 encoding for WebSocket accept key
 #[inline]
 fn base64_encode(input: &[u8]) -> String {
-    const CHARSET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const CHARSET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
     let mut i = 0;
 
@@ -161,12 +165,22 @@ fn base64_encode(input: &[u8]) -> String {
         let octet_b = if i + 1 < input.len() { input[i + 1] } else { 0 };
         let octet_c = if i + 2 < input.len() { input[i + 2] } else { 0 };
 
-        let triple = ((octet_a as u32) << 16) | ((octet_b as u32) << 8) | (octet_c as u32);
+        let triple = ((octet_a as u32) << 16)
+            | ((octet_b as u32) << 8)
+            | (octet_c as u32);
 
         output.push(CHARSET[((triple >> 18) & 0x3F) as usize] as char);
         output.push(CHARSET[((triple >> 12) & 0x3F) as usize] as char);
-        output.push(if i + 1 < input.len() { CHARSET[((triple >> 6) & 0x3F) as usize] as char } else { '=' });
-        output.push(if i + 2 < input.len() { CHARSET[(triple & 0x3F) as usize] as char } else { '=' });
+        output.push(if i + 1 < input.len() {
+            CHARSET[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if i + 2 < input.len() {
+            CHARSET[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
 
         i += 3;
     }
@@ -186,7 +200,10 @@ struct ThreadPool {
 
 impl ThreadPool {
     fn new(size: usize) -> Self {
-        let shared_data = Arc::new((Mutex::new(VecDeque::with_capacity(size * 2)), Condvar::new()));
+        let shared_data = Arc::new((
+            Mutex::new(VecDeque::with_capacity(size * 2)),
+            Condvar::new(),
+        ));
         let stop_signal = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(size);
 
@@ -201,7 +218,8 @@ impl ThreadPool {
                     let task: Job = {
                         let mut queue = lock.lock().unwrap();
 
-                        while !stop.load(Ordering::Acquire) && queue.is_empty() {
+                        while !stop.load(Ordering::Acquire) && queue.is_empty()
+                        {
                             queue = cvar.wait(queue).unwrap();
                         }
 
@@ -354,7 +372,14 @@ impl WebSocketFrame {
             }
         }
 
-        Ok((WebSocketFrame { fin, opcode, payload }, offset + payload_len as usize))
+        Ok((
+            WebSocketFrame {
+                fin,
+                opcode,
+                payload,
+            },
+            offset + payload_len as usize,
+        ))
     }
 
     // Serialize WebSocket frame to buffer
@@ -373,14 +398,15 @@ impl WebSocketFrame {
         let mut buffer = Vec::with_capacity(header_len + payload_len);
 
         // First byte: FIN + Opcode
-        let b1 = (if self.fin { 0x80 } else { 0x00 }) | (match self.opcode {
-            Opcode::Continuation => 0x0,
-            Opcode::Text => 0x1,
-            Opcode::Binary => 0x2,
-            Opcode::Close => 0x8,
-            Opcode::Ping => 0x9,
-            Opcode::Pong => 0xA,
-        });
+        let b1 = (if self.fin { 0x80 } else { 0x00 })
+            | (match self.opcode {
+                Opcode::Continuation => 0x0,
+                Opcode::Text => 0x1,
+                Opcode::Binary => 0x2,
+                Opcode::Close => 0x8,
+                Opcode::Ping => 0x9,
+                Opcode::Pong => 0xA,
+            });
         buffer.push(b1);
 
         // Second byte and extended length: Payload length (no mask for server->client)
@@ -401,12 +427,20 @@ impl WebSocketFrame {
 
     #[inline]
     fn create_pong(payload: Vec<u8>) -> Self {
-        WebSocketFrame { fin: true, opcode: Opcode::Pong, payload }
+        WebSocketFrame {
+            fin: true,
+            opcode: Opcode::Pong,
+            payload,
+        }
     }
 
     #[inline]
     fn create_close() -> Self {
-        WebSocketFrame { fin: true, opcode: Opcode::Close, payload: vec![] }
+        WebSocketFrame {
+            fin: true,
+            opcode: Opcode::Close,
+            payload: vec![],
+        }
     }
 }
 
@@ -464,8 +498,11 @@ fn percent_decode(bytes: &[u8]) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                let hex = &bytes[i+1..i+3];
-                if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or("00"), 16) {
+                let hex = &bytes[i + 1..i + 3];
+                if let Ok(byte) = u8::from_str_radix(
+                    std::str::from_utf8(hex).unwrap_or("00"),
+                    16,
+                ) {
                     result.push(byte);
                     i += 3;
                 } else {
@@ -488,7 +525,7 @@ fn percent_decode(bytes: &[u8]) -> String {
 
 fn split_path_query(path: &[u8]) -> (&[u8], &[u8]) {
     if let Some(qpos) = path.iter().position(|&b| b == b'?') {
-        (&path[..qpos], &path[qpos+1..])
+        (&path[..qpos], &path[qpos + 1..])
     } else {
         (path, &[])
     }
@@ -523,7 +560,11 @@ fn find_header_value<'a>(buffer: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
             let line_end = pos + end;
             if buffer[line_start..].starts_with(key) {
                 let mut val_start = line_start + key.len();
-                while val_start < line_end && (buffer[val_start] == b' ' || buffer[val_start] == b':' || buffer[val_start] == b'\t') {
+                while val_start < line_end
+                    && (buffer[val_start] == b' '
+                        || buffer[val_start] == b':'
+                        || buffer[val_start] == b'\t')
+                {
                     val_start += 1;
                 }
                 return Some(&buffer[val_start..line_end]);
@@ -536,7 +577,9 @@ fn find_header_value<'a>(buffer: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-fn handle_websocket_client(mut stream: TcpStream, room_name: String, peers: WebSocketPeers) {
+fn handle_websocket_client(
+    mut stream: TcpStream, room_name: String, peers: WebSocketPeers,
+) {
     struct SocketCloser {
         stream: Option<std::net::TcpStream>,
         peer_addr: std::net::SocketAddr,
@@ -552,7 +595,9 @@ fn handle_websocket_client(mut stream: TcpStream, room_name: String, peers: WebS
                 if let Some(room_peers) = rooms.get_mut(&self.room_name) {
                     let before_count = room_peers.len();
                     room_peers.retain(|peer| {
-                        peer.peer_addr().map(|a| a != self.peer_addr).unwrap_or(false)
+                        peer.peer_addr()
+                            .map(|a| a != self.peer_addr)
+                            .unwrap_or(false)
                     });
                     let after_count = room_peers.len();
 
@@ -582,10 +627,15 @@ fn handle_websocket_client(mut stream: TcpStream, room_name: String, peers: WebS
 
     {
         let mut rooms = peers.lock().unwrap();
-        let room_peers = rooms.entry(room_name.clone()).or_insert_with(Vec::new);
+        let room_peers =
+            rooms.entry(room_name.clone()).or_insert_with(Vec::new);
         if let Ok(clone) = closer.stream.as_ref().unwrap().try_clone() {
             room_peers.push(clone);
-            println!("WebSocket client connected to room '{}'. Total in room: {}", room_name, room_peers.len());
+            println!(
+                "WebSocket client connected to room '{}'. Total in room: {}",
+                room_name,
+                room_peers.len()
+            );
         }
     }
 
@@ -609,7 +659,9 @@ fn handle_websocket_client(mut stream: TcpStream, room_name: String, peers: WebS
                                     // Broadcast to all clients in the same room
                                     let resp_data = frame.serialize();
                                     let rooms = peers.lock().unwrap();
-                                    if let Some(room_peers) = rooms.get(&room_name) {
+                                    if let Some(room_peers) =
+                                        rooms.get(&room_name)
+                                    {
                                         for mut peer in room_peers.iter() {
                                             let _ = peer.write_all(&resp_data);
                                             let _ = peer.flush();
@@ -617,12 +669,15 @@ fn handle_websocket_client(mut stream: TcpStream, room_name: String, peers: WebS
                                     }
                                 }
                                 Opcode::Ping => {
-                                    let pong = WebSocketFrame::create_pong(frame.payload);
+                                    let pong = WebSocketFrame::create_pong(
+                                        frame.payload,
+                                    );
                                     let _ = stream.write_all(&pong.serialize());
                                 }
                                 Opcode::Close => {
                                     let close = WebSocketFrame::create_close();
-                                    let _ = stream.write_all(&close.serialize());
+                                    let _ =
+                                        stream.write_all(&close.serialize());
                                     buffer_len = 0;
                                     break;
                                 }
@@ -667,7 +722,9 @@ fn parse_method(buffer: &[u8]) -> Option<&[u8]> {
 #[inline]
 fn parse_path(buffer: &[u8]) -> Option<&[u8]> {
     let start = buffer.iter().position(|&b| b == b' ')? + 1;
-    let end = buffer[start..].iter().position(|&b| b == b' ' || b == b'\r')?;
+    let end = buffer[start..]
+        .iter()
+        .position(|&b| b == b' ' || b == b'\r')?;
 
     Some(&buffer[start..start + end])
 }
@@ -676,7 +733,11 @@ fn parse_path(buffer: &[u8]) -> Option<&[u8]> {
 #[inline]
 fn find_headers_end(buffer: &[u8]) -> Option<usize> {
     for i in 0..buffer.len().saturating_sub(3) {
-        if buffer[i] == b'\r' && buffer[i + 1] == b'\n' && buffer[i + 2] == b'\r' && buffer[i + 3] == b'\n' {
+        if buffer[i] == b'\r'
+            && buffer[i + 1] == b'\n'
+            && buffer[i + 2] == b'\r'
+            && buffer[i + 3] == b'\n'
+        {
             return Some(i + 4);
         }
     }
@@ -700,20 +761,20 @@ fn join_path_segments(segments: &[&[u8]]) -> String {
 fn mime_type(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
         "html" => "text/html",
-        "css"  => "text/css",
-        "js"   => "application/javascript",
+        "css" => "text/css",
+        "js" => "application/javascript",
         "json" => "application/json",
-        "png"  => "image/png",
+        "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
-        "gif"  => "image/gif",
-        "svg"  => "image/svg+xml",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
         "webp" => "image/webp",
-        "mp4"  => "video/mp4",
+        "mp4" => "video/mp4",
         "webm" => "video/webm",
-        "ogg"  => "video/ogg",
-        "txt"  => "text/plain",
-        "pdf"  => "application/pdf",
-        _      => "application/octet-stream",
+        "ogg" => "video/ogg",
+        "txt" => "text/plain",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -815,27 +876,51 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                         return;
                     }
                 } else if path == b"/rs/echo" {
-                    // Echo endpoint with query parameter "text"
+                    // Echo endpoint - match C++ /cc/echo behavior
                     let response_body;
-
-                    // Find "text" parameter
-                    let text_param = query_params.iter().find(|(k, _)| k == "text");
-
-                    if let Some((_, text_value)) = text_param {
-                        response_body = format!("Echo: {}", text_value);
+                    if query_params.is_empty() {
+                        // No params → return null (like C++)
+                        response_body = "null".to_string();
                     } else {
-                        // Return all parameters as JSON
-                        if query_params.is_empty() {
-                            response_body = "{}".to_string();
-                        } else {
-                            let mut parts = Vec::new();
-                            for (k, v) in &query_params {
-                                parts.push(format!("\"{}\":\"{}\"", k, v));
+                        // All params as JSON object (like C++)
+                        let mut parts = Vec::new();
+                        for (k, v) in &query_params {
+                            // Escape JSON special characters in key (like C++)
+                            let mut escaped_key = String::new();
+                            for c in k.chars() {
+                                match c {
+                                    '"' => escaped_key.push_str("\\\""),
+                                    '\\' => escaped_key.push_str("\\\\"),
+                                    '\u{0008}' => escaped_key.push_str(r#"\b"#),
+                                    '\u{000C}' => escaped_key.push_str(r#"\f"#),
+                                    '\n' => escaped_key.push_str("\\n"),
+                                    '\r' => escaped_key.push_str("\\r"),
+                                    '\t' => escaped_key.push_str("\\t"),
+                                    _ => escaped_key.push(c),
+                                }
                             }
-                            response_body = format!("{{{}}}", parts.join(","));
+                            // Empty value → null, otherwise escaped string (like C++)
+                            if v.is_empty() {
+                                parts.push(format!("\"{}\":null", escaped_key));
+                            } else {
+                                let mut escaped_val = String::new();
+                                for c in v.chars() {
+                                    match c {
+                                        '"' => escaped_val.push_str("\\\""),
+                                        '\\' => escaped_val.push_str("\\\\"),
+                                        '\u{0008}' => escaped_key.push_str(r#"\b"#),
+                                        '\u{000C}' => escaped_key.push_str(r#"\f"#),
+                                        '\n' => escaped_val.push_str("\\n"),
+                                        '\r' => escaped_val.push_str("\\r"),
+                                        '\t' => escaped_val.push_str("\\t"),
+                                        _ => escaped_val.push(c),
+                                    }
+                                }
+                                parts.push(format!("\"{}\":\"{}\"", escaped_key, escaped_val));
+                            }
                         }
+                        response_body = format!("{{{}}}", parts.join(","));
                     }
-
                     let response = format!(
                         "HTTP/1.1 200 OK\r\n\
                          Content-Type: application/json\r\n\
@@ -846,17 +931,25 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                         response_body.len(),
                         response_body
                     );
-
-                    if stream.write_all(response.as_bytes()).is_err() { return; }
-                    if stream.flush().is_err() { return; }
-                } else if path.starts_with(b"/rs/") && !path.starts_with(b"/rs/json/") && path != b"/rs/json" {
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                    if stream.flush().is_err() {
+                        return;
+                    }
+                } else if path.starts_with(b"/rs/")
+                    && !path.starts_with(b"/rs/json/")
+                    && path != b"/rs/json"
+                {
                     // Dynamic path for /rs/* (except /rs/json and /rs/json/*)
                     // Parse path segments after /rs/
                     let mut segments: Vec<&[u8]> = Vec::new();
                     let mut start = 4; // after "/rs/"
 
                     while start < path.len() {
-                        if let Some(end) = path[start..].iter().position(|&b| b == b'/') {
+                        if let Some(end) =
+                            path[start..].iter().position(|&b| b == b'/')
+                        {
                             if start < start + end {
                                 segments.push(&path[start..start + end]);
                             }
@@ -899,7 +992,8 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
 
                     // Validate room name
                     if room_name_bytes.is_empty() {
-                        const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
+                        const BAD_REQUEST: &[u8] =
+                            b"HTTP/1.1 400 Bad Request\r\n\
                                                     Content-Length: 15\r\n\
                                                     Connection: close\r\n\
                                                     \r\n\
@@ -909,16 +1003,31 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                     }
 
                     // Check for WebSocket upgrade
-                    if let Some(key) = find_header_value(&buffer[processed..used], b"Sec-WebSocket-Key:") {
-                        if let Some(upgrade) = find_header_value(&buffer[processed..used], b"Upgrade:") {
+                    if let Some(key) = find_header_value(
+                        &buffer[processed..used],
+                        b"Sec-WebSocket-Key:",
+                    ) {
+                        if let Some(upgrade) = find_header_value(
+                            &buffer[processed..used],
+                            b"Upgrade:",
+                        ) {
                             if upgrade.eq_ignore_ascii_case(b"websocket") {
                                 if let Ok(key_str) = std::str::from_utf8(key) {
                                     let response = websocket_handshake(key_str);
-                                    if stream.write_all(response.as_bytes()).is_ok() {
+                                    if stream
+                                        .write_all(response.as_bytes())
+                                        .is_ok()
+                                    {
                                         // Convert room name to String
-                                        let room_name = String::from_utf8_lossy(room_name_bytes).to_string();
+                                        let room_name =
+                                            String::from_utf8_lossy(
+                                                room_name_bytes,
+                                            )
+                                            .to_string();
                                         // Switch to WebSocket mode with room name
-                                        handle_websocket_client(stream, room_name, peers);
+                                        handle_websocket_client(
+                                            stream, room_name, peers,
+                                        );
                                         return;
                                     }
                                 }
@@ -946,12 +1055,18 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                                   Connection: keep-alive\r\n\
                                                   \r\n\
                                                   Not Found";
-                        if stream.write_all(NOT_FOUND).is_err() { return; }
+                        if stream.write_all(NOT_FOUND).is_err() {
+                            return;
+                        }
                         continue;
                     }
 
                     // Build the full filesystem path
-                    let full_path = Path::new(PUBLIC_DIR).join(requested_path.strip_prefix("/").unwrap_or(requested_path));
+                    let full_path = Path::new(PUBLIC_DIR).join(
+                        requested_path
+                            .strip_prefix("/")
+                            .unwrap_or(requested_path),
+                    );
 
                     // Security: canonicalize both public dir and full path, then verify prefix
                     let public_canon = match fs::canonicalize(PUBLIC_DIR) {
@@ -963,7 +1078,9 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                                       Connection: keep-alive\r\n\
                                                       \r\n\
                                                       Not Found";
-                            if stream.write_all(NOT_FOUND).is_err() { return; }
+                            if stream.write_all(NOT_FOUND).is_err() {
+                                return;
+                            }
                             continue;
                         }
                     };
@@ -977,7 +1094,9 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                                       Connection: keep-alive\r\n\
                                                       \r\n\
                                                       Not Found";
-                            if stream.write_all(NOT_FOUND).is_err() { return; }
+                            if stream.write_all(NOT_FOUND).is_err() {
+                                return;
+                            }
                             continue;
                         }
                     };
@@ -989,7 +1108,9 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                                   Connection: keep-alive\r\n\
                                                   \r\n\
                                                   Forbidden";
-                        if stream.write_all(FORBIDDEN).is_err() { return; }
+                        if stream.write_all(FORBIDDEN).is_err() {
+                            return;
+                        }
                         continue;
                     }
 
@@ -1000,7 +1121,9 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                                   Connection: keep-alive\r\n\
                                                   \r\n\
                                                   Not Found";
-                        if stream.write_all(NOT_FOUND).is_err() { return; }
+                        if stream.write_all(NOT_FOUND).is_err() {
+                            return;
+                        }
                         continue;
                     }
 
@@ -1013,14 +1136,17 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                                                       Connection: keep-alive\r\n\
                                                       \r\n\
                                                       Not Found";
-                            if stream.write_all(NOT_FOUND).is_err() { return; }
+                            if stream.write_all(NOT_FOUND).is_err() {
+                                return;
+                            }
                             continue;
                         }
                     };
                     let file_len = metadata.len();
-                    let ext = file_canon.extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("");
+                    let ext = file_canon
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
                     let content_type = mime_type(ext);
 
                     // Send headers
@@ -1032,7 +1158,9 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                          \r\n",
                         content_type, file_len
                     );
-                    if stream.write_all(headers.as_bytes()).is_err() { return; }
+                    if stream.write_all(headers.as_bytes()).is_err() {
+                        return;
+                    }
 
                     // Stream the file
                     let mut file = match File::open(&file_canon) {
@@ -1042,11 +1170,16 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
                             return;
                         }
                     };
-                    if copy(&mut file, &mut stream).is_err() { return; }
-                    if stream.flush().is_err() { return; }
+                    if copy(&mut file, &mut stream).is_err() {
+                        return;
+                    }
+                    if stream.flush().is_err() {
+                        return;
+                    }
                 }
             } else {
-                const METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
+                const METHOD_NOT_ALLOWED: &[u8] =
+                    b"HTTP/1.1 405 Method Not Allowed\r\n\
                                                    Content-Length: 18\r\n\
                                                    Connection: keep-alive\r\n\
                                                    \r\n\
@@ -1085,8 +1218,9 @@ fn handle_client(mut stream: TcpStream, peers: WebSocketPeers) {
 // --------------------------------------------------------- //
 
 fn main() {
-    let listener = TcpListener::bind(format!("{}:{}", ADDRESS_IP, ADDRESS_PORT))
-        .expect("Failed to bind port");
+    let listener =
+        TcpListener::bind(format!("{}:{}", ADDRESS_IP, ADDRESS_PORT))
+            .expect("Failed to bind port");
 
     // Set larger listen backlog
     let _ = listener.set_ttl(64);
@@ -1097,10 +1231,10 @@ fn main() {
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1); // Fallback if detection fails
-    
+
     // C++ equivalent: max(min(target, 256), hardware_concurrency)
     let thread_count = CONNECTION_CONCURRENT_TARGET.max(cpu_count);
-    
+
     let pool = ThreadPool::new(thread_count);
     let peers: WebSocketPeers = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1109,7 +1243,9 @@ fn main() {
     println!("  - JSON endpoint: /rs/json");
     println!("  - Echo endpoint: /rs/echo?text=hello (query parameters)");
     println!("  - Dynamic path: /rs/{{path1}}/{{path2}}/... (except /rs/json)");
-    println!("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)");
+    println!(
+        "  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)"
+    );
 
     for stream in listener.incoming() {
         match stream {
