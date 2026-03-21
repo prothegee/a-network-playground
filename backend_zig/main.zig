@@ -85,7 +85,7 @@ fn setTcpNoDelay(handle: std.posix.socket_t) void {
     posix.setsockopt(handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&flag)) catch {};
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------- //
 
 fn ipAddressToSockAddr(addr: std.Io.net.IpAddress, sockaddr: *posix.sockaddr) posix.socklen_t {
     return switch (addr) {
@@ -132,7 +132,7 @@ fn ipAddressFromSockAddr(sa: *const posix.sockaddr, len: posix.socklen_t) !std.I
     return error.AddressFamilyUnsupported;
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------- //
 
 fn createListeningSocket(addr: std.Io.net.IpAddress) !posix.fd_t {
     const domain: u32 = switch (addr) {
@@ -210,7 +210,7 @@ fn checkSyscall(rc: usize) !usize {
     }
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------- //
 
 // blocking I/O
 fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
@@ -269,7 +269,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
     }
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------- //
 
 fn workerThread(allocator: std.mem.Allocator) !void {
     var io = std.Io.Threaded.init(allocator, .{
@@ -296,6 +296,7 @@ fn workerThread(allocator: std.mem.Allocator) !void {
             .handle = fd,
             .address = addr,
         },
+        .options = {},
     };
 
     while (true) {
@@ -310,7 +311,7 @@ fn workerThread(allocator: std.mem.Allocator) !void {
     }
 }
 
-// ----------------------------------------------------------------------------
+// --------------------------------------------------------- //
 
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
