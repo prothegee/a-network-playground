@@ -90,7 +90,7 @@ fn setTcpNoDelay(handle: std.posix.socket_t) void {
 fn ipAddressToSockAddr(addr: std.Io.net.IpAddress, sockaddr: *posix.sockaddr) posix.socklen_t {
     return switch (addr) {
         .ip4 => |a| {
-            const in = @as(*posix.sockaddr.in, @alignCast(@ptrCast(sockaddr)));
+            const in = @as(*posix.sockaddr.in, @ptrCast(@alignCast(sockaddr)));
             in.* = .{
                 .family = posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, a.port),
@@ -100,7 +100,7 @@ fn ipAddressToSockAddr(addr: std.Io.net.IpAddress, sockaddr: *posix.sockaddr) po
             return @sizeOf(posix.sockaddr.in);
         },
         .ip6 => |a| {
-            const in6 = @as(*posix.sockaddr.in6, @alignCast(@ptrCast(sockaddr)));
+            const in6 = @as(*posix.sockaddr.in6, @ptrCast(@alignCast(sockaddr)));
             in6.* = .{
                 .family = posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, a.port),
@@ -115,13 +115,13 @@ fn ipAddressToSockAddr(addr: std.Io.net.IpAddress, sockaddr: *posix.sockaddr) po
 
 fn ipAddressFromSockAddr(sa: *const posix.sockaddr, len: posix.socklen_t) !std.Io.net.IpAddress {
     if (len == @sizeOf(posix.sockaddr.in) and sa.family == posix.AF.INET) {
-        const in = @as(*const posix.sockaddr.in, @alignCast(@ptrCast(sa)));
+        const in = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(sa)));
         return .{ .ip4 = .{
             .bytes = @bitCast(in.addr),
             .port = std.mem.bigToNative(u16, in.port),
         } };
     } else if (len >= @sizeOf(posix.sockaddr.in6) and sa.family == posix.AF.INET6) {
-        const in6 = @as(*const posix.sockaddr.in6, @alignCast(@ptrCast(sa)));
+        const in6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(sa)));
         return .{ .ip6 = .{
             .bytes = in6.addr,
             .port = std.mem.bigToNative(u16, in6.port),
@@ -352,4 +352,3 @@ pub fn main() !void {
 // Requests/sec: 485539.59
 // Transfer/sec:     42.60MB
 //
-
