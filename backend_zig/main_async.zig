@@ -7,6 +7,11 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
 // --------------------------------------------------------- //
 
+// NOTE:
+// TESTED in: zig 0.16.0-dev.2974+83c7aba12
+// consider std.Io.Evented (epoll/kqueue/io_uring) for more burst/high concurrent
+//
+
 //
 // TODO:
 // [X] multi-threaded http server
@@ -16,11 +21,120 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 // [X] websocket support
 // [X] query parameters parsing
 // [X] dynamic thread count (hardware_concurrency)
-// [?] public file access
 // [X] not full http spec
 // [X] async / non-blocking server (std.Io)
 // [X] dynamic path routing
+// [X] public file access, from `$(pwd)/public` relative from the exec run
+// [?] able upload file multiples `$(pwd)/public/u` relative from the exec run
 //
+
+// --------------------------------------------------------- //
+
+// MIME type mapping for static files
+fn mimeType(ext: []const u8) []const u8 {
+    if (std.mem.eql(u8, ext, "html")) return "text/html";
+    if (std.mem.eql(u8, ext, "css")) return "text/css";
+    if (std.mem.eql(u8, ext, "js")) return "application/javascript";
+    if (std.mem.eql(u8, ext, "json")) return "application/json";
+    if (std.mem.eql(u8, ext, "png")) return "image/png";
+    if (std.mem.eql(u8, ext, "jpg") or std.mem.eql(u8, ext, "jpeg")) return "image/jpeg";
+    if (std.mem.eql(u8, ext, "gif")) return "image/gif";
+    if (std.mem.eql(u8, ext, "svg")) return "image/svg+xml";
+    if (std.mem.eql(u8, ext, "webp")) return "image/webp";
+    if (std.mem.eql(u8, ext, "mp4")) return "video/mp4";
+    if (std.mem.eql(u8, ext, "webm")) return "video/webm";
+    if (std.mem.eql(u8, ext, "ogg")) return "video/ogg";
+    if (std.mem.eql(u8, ext, "txt")) return "text/plain";
+    if (std.mem.eql(u8, ext, "pdf")) return "application/pdf";
+    return "application/octet-stream";
+}
+
+// Get file extension from path
+fn getFileExtension(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot_pos| {
+        if (dot_pos + 1 < path.len) {
+            return path[dot_pos + 1 ..];
+        }
+    }
+    return "";
+}
+
+// Serve static file from ./public directory
+// Returns true if file was served (200, 403, or 404 response sent)
+// Returns false if public dir missing or path not applicable
+fn serveStaticFile(request: *std.http.Server.Request, sub_path: []const u8, io: std.Io) !bool {
+    // Security: prevent directory traversal
+    if (std.mem.indexOf(u8, sub_path, "..") != null) {
+        return false;
+    }
+
+    // Build full path: ./public/{sub_path}
+    const public_dir = "./public";
+    var full_path_buf: [512]u8 = undefined;
+
+    if (public_dir.len + 1 + sub_path.len > full_path_buf.len) {
+        return false;
+    }
+
+    @memcpy(full_path_buf[0..public_dir.len], public_dir);
+    full_path_buf[public_dir.len] = '/';
+    @memcpy(full_path_buf[public_dir.len + 1 ..][0..sub_path.len], sub_path);
+    const full_path = full_path_buf[0 .. public_dir.len + 1 + sub_path.len];
+
+    // Open file
+    const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch {
+        // File not found - do NOT send response here, let caller handle it
+        return false;
+    };
+    defer file.close(io);
+
+    // Get file stats
+    const stat = file.stat(io) catch {
+        return false;
+    };
+
+    // Only serve regular files
+    if (stat.kind != .file) {
+        return false;
+    }
+
+    // Get MIME type
+    const content_type = mimeType(getFileExtension(sub_path));
+
+    // Build response headers
+    var header_buffer: [1024]u8 = undefined;
+    const header_slice = std.fmt.bufPrint(
+        &header_buffer,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "\r\n",
+        .{ content_type, stat.size },
+    ) catch return false;
+
+    // Send headers using request.server.out directly (std.Io.Writer)
+    request.server.out.writeAll(header_slice) catch return false;
+
+    // Stream file contents - READER CREATED ONCE BEFORE LOOP (like C++ open() + read loop)
+    var file_read_buffer: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_read_buffer);
+    var copy_buffer: [8192]u8 = undefined;
+    var remaining = stat.size;
+
+    while (remaining > 0) {
+        const to_read = @min(remaining, copy_buffer.len);
+        const bytes_read = file_reader.interface.readSliceShort(copy_buffer[0..to_read]) catch break;
+        if (bytes_read == 0) break;
+        request.server.out.writeAll(copy_buffer[0..bytes_read]) catch break;
+        remaining -= bytes_read;
+    }
+
+    // revent lock/stuck when requesting exists served file
+    request.server.out.flush() catch return false;
+
+    return true;
+}
 
 // --------------------------------------------------------- //
 
@@ -63,7 +177,6 @@ const WebSocketFrame = struct {
 // Parse WebSocket frame from buffer
 fn parseWebSocketFrame(data: []const u8) ?struct { frame: WebSocketFrame, consumed: usize } {
     if (data.len < 2) return null;
-
     var offset: usize = 0;
 
     // First byte: FIN + RSV + Opcode
@@ -82,27 +195,34 @@ fn parseWebSocketFrame(data: []const u8) ?struct { frame: WebSocketFrame, consum
     // Extended payload length
     if (payload_length == 126) {
         if (data.len < offset + 2) return null;
+
         payload_length = @as(u64, data[offset]) << 8 | data[offset + 1];
+
         offset += 2;
     } else if (payload_length == 127) {
         if (data.len < offset + 8) return null;
+
         payload_length = 0;
+
         for (0..8) |i| {
             payload_length = (payload_length << 8) | data[offset + i];
         }
+
         offset += 8;
     }
 
     // Masking key
     var masking_key: [4]u8 = .{ 0, 0, 0, 0 };
+
     if (masked) {
         if (data.len < offset + 4) return null;
-        @memcpy(&masking_key, data[offset..offset + 4]);
+        @memcpy(&masking_key, data[offset .. offset + 4]);
         offset += 4;
     }
 
     // Payload
     if (data.len < offset + payload_length) return null;
+
     const payload_start = offset;
     const payload_end = offset + payload_length;
 
@@ -159,7 +279,7 @@ fn serializeWebSocketFrame(buffer: []u8, opcode: WebSocketOpcode, payload: []con
     var temp_payload: [4096]u8 = undefined;
     const copy_len = @min(payload.len, temp_payload.len);
     @memcpy(temp_payload[0..copy_len], payload[0..copy_len]);
-    @memcpy(buffer[offset..offset + copy_len], temp_payload[0..copy_len]);
+    @memcpy(buffer[offset .. offset + copy_len], temp_payload[0..copy_len]);
     offset += copy_len;
 
     return offset;
@@ -199,6 +319,7 @@ fn addConnectionToRoom(room_name: []const u8, conn: *WebSocketConnection, io: st
 
     gop.value_ptr.mutex.lock(io) catch return;
     defer gop.value_ptr.mutex.unlock(io);
+
     gop.value_ptr.connections.append(g_ws_allocator, conn) catch return;
 
     // Log connection (like C++ reference)
@@ -280,7 +401,6 @@ fn broadcastToRoom(room_name: []const u8, message: []const u8, io: std.Io) void 
             // Each connection needs its own writer buffer
             var write_buffer: [4096]u8 = undefined;
             var conn_writer = conn.stream.writer(conn.io, &write_buffer);
-
             conn_writer.interface.writeAll(frame_data) catch {
                 // Connection failed, mark for removal
                 if (failed_count < failed_indices.len) {
@@ -317,6 +437,8 @@ fn broadcastToRoom(room_name: []const u8, message: []const u8, io: std.Io) void 
         }
     }
 }
+
+// --------------------------------------------------------- //
 
 // Async client handler - new std.Io async I/O system (Zig 0.16.x)
 fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
@@ -372,7 +494,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             // Check for WebSocket upgrade headers
             var sec_ws_key: ?[]const u8 = null;
             var is_upgrade = false;
-
             var it = request.iterateHeaders();
             while (it.next()) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, "upgrade")) {
@@ -393,10 +514,10 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 var handshake_response: [512]u8 = undefined;
                 const handshake_slice = std.fmt.bufPrint(&handshake_response,
                     "HTTP/1.1 101 Switching Protocols\r\n" ++
-                    "Upgrade: websocket\r\n" ++
-                    "Connection: Upgrade\r\n" ++
-                    "Sec-WebSocket-Accept: {s}\r\n" ++
-                    "\r\n",
+                        "Upgrade: websocket\r\n" ++
+                        "Connection: Upgrade\r\n" ++
+                        "Sec-WebSocket-Accept: {s}\r\n" ++
+                        "\r\n",
                     .{accept_key},
                 ) catch break;
 
@@ -420,7 +541,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 // WebSocket frame loop (per-room broadcast)
                 var frame_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
                 var buffer_used: usize = 0;
-
                 while (true) {
                     // Read more data if needed - use readSliceShort, NOT stream()
                     if (buffer_used < frame_buffer.len - 1) {
@@ -466,13 +586,12 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                                 // Not handling fragmented messages
                             },
                         }
-
                         offset += consumed;
                     }
 
                     // Remove processed data from buffer
                     if (offset > 0 and offset < buffer_used) {
-                        @memmove(frame_buffer[0..buffer_used - offset], frame_buffer[offset..buffer_used]);
+                        @memmove(frame_buffer[0 .. buffer_used - offset], frame_buffer[offset..buffer_used]);
                         buffer_used -= offset;
                     } else if (offset >= buffer_used) {
                         buffer_used = 0;
@@ -486,6 +605,9 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             // Not a WebSocket request, fall through to normal HTTP
         }
 
+        // Dynamic route handling FIRST (like C++ reference - check routes before static files)
+        var handled = false;
+
         if (std.mem.eql(u8, path, "/zig")) {
             // Async respond: suspends until write completes
             // respond() internally handles discardBody() for keep-alive
@@ -494,19 +616,20 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 .keep_alive = true,
                 .version = std.http.Version.@"HTTP/1.1",
             }) catch break;
+            handled = true;
         } else if (std.mem.eql(u8, path, "/zig/json")) {
             request.respond("{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}", .{
                 .status = std.http.Status.ok,
                 .keep_alive = true,
                 .version = std.http.Version.@"HTTP/1.1",
             }) catch break;
+            handled = true;
         } else if (std.mem.eql(u8, path, "/zig/echo")) {
             // Build JSON response for query parameters
             var response_body: std.ArrayList(u8) = .empty;
             defer response_body.deinit(std.heap.smp_allocator);
-
             if (query.len == 0) {
-                // No params → return null
+                // No params — return null
                 response_body.appendSlice(std.heap.smp_allocator, "null") catch break;
             } else {
                 // All params as JSON object
@@ -522,8 +645,8 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                         const val = pair[eq_pos + 1 ..];
 
                         if (!first) response_body.appendSlice(std.heap.smp_allocator, ",") catch break;
-                        first = false;
 
+                        first = false;
                         response_body.append(std.heap.smp_allocator, '"') catch break;
                         response_body.appendSlice(std.heap.smp_allocator, key) catch break;
                         response_body.appendSlice(std.heap.smp_allocator, "\":") catch break;
@@ -537,13 +660,12 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                         }
                     } else {
                         if (!first) response_body.appendSlice(std.heap.smp_allocator, ",") catch break;
-                        first = false;
 
+                        first = false;
                         response_body.append(std.heap.smp_allocator, '"') catch break;
                         response_body.appendSlice(std.heap.smp_allocator, pair) catch break;
                         response_body.appendSlice(std.heap.smp_allocator, "\":null") catch break;
                     }
-
                     pos = amp_pos + 1;
                 }
                 response_body.append(std.heap.smp_allocator, '}') catch break;
@@ -554,6 +676,8 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 .keep_alive = true,
                 .version = std.http.Version.@"HTTP/1.1",
             }) catch break;
+
+            handled = true;
         } else if (std.mem.startsWith(u8, path, "/zig/")) {
             // Dynamic path routing: /zig/{path1}/{path2}/...
             var response_body: std.ArrayList(u8) = .empty;
@@ -568,7 +692,22 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 .keep_alive = true,
                 .version = std.http.Version.@"HTTP/1.1",
             }) catch break;
-        } else {
+
+            handled = true;
+        }
+
+        // Try static files ONLY if no dynamic route matched (like C++ reference else block)
+        if (!handled) {
+            if (std.mem.startsWith(u8, path, "/")) {
+                const sub_path = path[1..];
+                const file_served = serveStaticFile(&request, sub_path, io) catch false;
+                if (file_served) {
+                    // File served successfully, continue to next request
+                    continue;
+                }
+            }
+
+            // No route matched and static file not found — send 404
             request.respond("Not Found", .{
                 .status = std.http.Status.not_found,
                 .keep_alive = true,
@@ -576,9 +715,11 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             }) catch break;
         }
 
-        // REMOVED: discardBody() is private - respond() handles it internally
+        // REMOVED: discardBody() is private - respond() handles it internally?
     }
 }
+
+// --------------------------------------------------------- //
 
 // Async-aware server loop with io.concurrent() for task spawning
 fn runServer(io: std.Io) !void {
@@ -600,6 +741,7 @@ fn runServer(io: std.Io) !void {
     std.debug.print("  - Echo endpoint: /zig/echo?text=hello (query parameters)\n", .{});
     std.debug.print("  - Dynamic path: /zig/{{path1}}/{{path2}}/... (except /zig/json)\n", .{});
     std.debug.print("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)\n", .{});
+    std.debug.print("  - Static files from ./public at root (e.g., /image.jpg)\n", .{});
 
     while (true) {
         // Async accept: suspends until new connection available
@@ -635,20 +777,13 @@ pub fn main() !void {
     });
     defer io.deinit();
 
-    // // log detected CPU count for debugging
-    // if (std.Thread.getCpuCount()) |cpu_count| {
-    //     std.debug.print("Detected {d} CPU cores\n", .{cpu_count});
-    // } else |_| {
-    //     std.debug.print("CPU count detection failed, using defaults\n", .{});
-    // }
-
     try runServer(io.io());
 }
 
 //
 // IMPORTANT:
 // this implementation result:
-// ➜ wrk -c100 -t6 -d10s http://localhost:9007/zig
+// → wrk -c100 -t6 -d10s http://localhost:9007/zig
 // Running 10s test @ http://localhost:9007/zig
 //   6 threads and 100 connections
 //   Thread Stats   Avg      Stdev     Max   +/- Stdev
@@ -657,8 +792,6 @@ pub fn main() !void {
 //   4028055 requests in 10.10s, 161.34MB read
 // Requests/sec: 398844.18
 // Transfer/sec:     15.98MB
-//
-
 //
 // ASYNC VERIFICATION (Zig 0.16.x - std.Io):
 // - std.Io.Threaded provides async I/O backend with thread pool
