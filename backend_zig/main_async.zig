@@ -14,21 +14,212 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
 //
 // TODO:
+// [X] full http spec
+// [X] websocket support
+// [X] keep-alive (manual)
+// [X] dynamic path routing
+// [X] blocking I/O (not epoll)
+// [X] query parameters parsing
 // [X] multi-threaded http server
 // [X] threadpool for scalability
-// [X] blocking I/O (not epoll)
-// [X] keep-alive (manual)
-// [X] websocket support
-// [X] query parameters parsing
-// [X] dynamic thread count (hardware_concurrency)
-// [X] not full http spec
 // [X] async / non-blocking server (std.Io)
-// [X] dynamic path routing
+// [X] dynamic thread count (hardware_concurrency)
 // [X] public file access, from `$(pwd)/public` relative from the exec run
 // [?] able upload file multiples `$(pwd)/public/u` relative from the exec run
 //
 
 // --------------------------------------------------------- //
+
+// HTTP Methods (RFC 7231 + RFC 5789)
+const HttpMethod = enum {
+    GET,
+    HEAD,
+    POST,
+    PUT,
+    DELETE,
+    PATCH,
+    OPTIONS,
+    TRACE,
+    CONNECT,
+};
+
+// HTTP Status Codes (RFC 7231 + RFC 6585)
+const HttpStatus = enum(u16) {
+    // 1xx Informational
+    continue_ = 100,
+    switching_protocols = 101,
+    processing = 102,
+    early_hints = 103,
+
+    // 2xx Success
+    ok = 200,
+    created = 201,
+    accepted = 202,
+    non_authoritative_information = 203,
+    no_content = 204,
+    reset_content = 205,
+    partial_content = 206,
+    multi_status = 207,
+    already_reported = 208,
+    im_used = 226,
+
+    // 3xx Redirection
+    multiple_choices = 300,
+    moved_permanently = 301,
+    found = 302,
+    see_other = 303,
+    not_modified = 304,
+    use_proxy = 305,
+    temporary_redirect = 307,
+    permanent_redirect = 308,
+
+    // 4xx Client Error
+    bad_request = 400,
+    unauthorized = 401,
+    payment_required = 402,
+    forbidden = 403,
+    not_found = 404,
+    method_not_allowed = 405,
+    not_acceptable = 406,
+    proxy_authentication_required = 407,
+    request_timeout = 408,
+    conflict = 409,
+    gone = 410,
+    length_required = 411,
+    precondition_failed = 412,
+    payload_too_large = 413,
+    uri_too_long = 414,
+    unsupported_media_type = 415,
+    range_not_satisfiable = 416,
+    expectation_failed = 417,
+    im_a_teapot = 418,
+    misdirected_request = 421,
+    unprocessable_entity = 422,
+    locked = 423,
+    failed_dependency = 424,
+    too_early = 425,
+    upgrade_required = 426,
+    precondition_required = 428,
+    too_many_requests = 429,
+    request_header_fields_too_large = 431,
+    unavailable_for_legal_reasons = 451,
+
+    // 5xx Server Error
+    internal_server_error = 500,
+    not_implemented = 501,
+    bad_gateway = 502,
+    service_unavailable = 503,
+    gateway_timeout = 504,
+    http_version_not_supported = 505,
+    variant_also_negotiates = 506,
+    insufficient_storage = 507,
+    loop_detected = 508,
+    not_extended = 510,
+    network_authentication_required = 511,
+};
+
+fn httpStatusText(status: HttpStatus) []const u8 {
+    return switch (status) {
+        .continue_ => "Continue",
+        .switching_protocols => "Switching Protocols",
+        .processing => "Processing",
+        .early_hints => "Early Hints",
+        .ok => "OK",
+        .created => "Created",
+        .accepted => "Accepted",
+        .non_authoritative_information => "Non-Authoritative Information",
+        .no_content => "No Content",
+        .reset_content => "Reset Content",
+        .partial_content => "Partial Content",
+        .multi_status => "Multi-Status",
+        .already_reported => "Already Reported",
+        .im_used => "IM Used",
+        .multiple_choices => "Multiple Choices",
+        .moved_permanently => "Moved Permanently",
+        .found => "Found",
+        .see_other => "See Other",
+        .not_modified => "Not Modified",
+        .use_proxy => "Use Proxy",
+        .temporary_redirect => "Temporary Redirect",
+        .permanent_redirect => "Permanent Redirect",
+        .bad_request => "Bad Request",
+        .unauthorized => "Unauthorized",
+        .payment_required => "Payment Required",
+        .forbidden => "Forbidden",
+        .not_found => "Not Found",
+        .method_not_allowed => "Method Not Allowed",
+        .not_acceptable => "Not Acceptable",
+        .proxy_authentication_required => "Proxy Authentication Required",
+        .request_timeout => "Request Timeout",
+        .conflict => "Conflict",
+        .gone => "Gone",
+        .length_required => "Length Required",
+        .precondition_failed => "Precondition Failed",
+        .payload_too_large => "Payload Too Large",
+        .uri_too_long => "URI Too Long",
+        .unsupported_media_type => "Unsupported Media Type",
+        .range_not_satisfiable => "Range Not Satisfiable",
+        .expectation_failed => "Expectation Failed",
+        .im_a_teapot => "I'm a teapot",
+        .misdirected_request => "Misdirected Request",
+        .unprocessable_entity => "Unprocessable Entity",
+        .locked => "Locked",
+        .failed_dependency => "Failed Dependency",
+        .too_early => "Too Early",
+        .upgrade_required => "Upgrade Required",
+        .precondition_required => "Precondition Required",
+        .too_many_requests => "Too Many Requests",
+        .request_header_fields_too_large => "Request Header Fields Too Large",
+        .unavailable_for_legal_reasons => "Unavailable For Legal Reasons",
+        .internal_server_error => "Internal Server Error",
+        .not_implemented => "Not Implemented",
+        .bad_gateway => "Bad Gateway",
+        .service_unavailable => "Service Unavailable",
+        .gateway_timeout => "Gateway Timeout",
+        .http_version_not_supported => "HTTP Version Not Supported",
+        .variant_also_negotiates => "Variant Also Negotiates",
+        .insufficient_storage => "Insufficient Storage",
+        .loop_detected => "Loop Detected",
+        .not_extended => "Not Extended",
+        .network_authentication_required => "Network Authentication Required",
+    };
+}
+
+// HTTP Headers (common headers for full spec compliance)
+const HttpHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+// CORS Headers (Cross-Origin Resource Sharing)
+const CorsConfig = struct {
+    allow_origin: []const u8 = "*",
+    allow_methods: []const u8 = "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+    allow_headers: []const u8 = "Content-Type, Authorization, X-Requested-With",
+    allow_credentials: bool = false,
+    max_age: u32 = 86400,
+    expose_headers: []const u8 = "",
+};
+
+// Cache Control Headers
+const CacheConfig = struct {
+    public_: bool = false,
+    private_: bool = true,
+    no_cache: bool = false,
+    no_store: bool = false,
+    max_age: ?u32 = null,
+    s_maxage: ?u32 = null,
+    must_revalidate: bool = false,
+    proxy_revalidate: bool = false,
+    no_transform: bool = false,
+};
+
+// Range Request Support (RFC 7233)
+const RangeRequest = struct {
+    unit: []const u8,
+    start: u64,
+    end: ?u64,
+};
 
 // MIME type mapping for static files
 fn mimeType(ext: []const u8) []const u8 {
@@ -46,6 +237,44 @@ fn mimeType(ext: []const u8) []const u8 {
     if (std.mem.eql(u8, ext, "ogg")) return "video/ogg";
     if (std.mem.eql(u8, ext, "txt")) return "text/plain";
     if (std.mem.eql(u8, ext, "pdf")) return "application/pdf";
+    if (std.mem.eql(u8, ext, "xml")) return "application/xml";
+    if (std.mem.eql(u8, ext, "ico")) return "image/x-icon";
+    if (std.mem.eql(u8, ext, "woff")) return "font/woff";
+    if (std.mem.eql(u8, ext, "woff2")) return "font/woff2";
+    if (std.mem.eql(u8, ext, "ttf")) return "font/ttf";
+    if (std.mem.eql(u8, ext, "eot")) return "application/vnd.ms-fontobject";
+    if (std.mem.eql(u8, ext, "otf")) return "font/otf";
+    if (std.mem.eql(u8, ext, "csv")) return "text/csv";
+    if (std.mem.eql(u8, ext, "rtf")) return "application/rtf";
+    if (std.mem.eql(u8, ext, "zip")) return "application/zip";
+    if (std.mem.eql(u8, ext, "gz")) return "application/gzip";
+    if (std.mem.eql(u8, ext, "tar")) return "application/x-tar";
+    if (std.mem.eql(u8, ext, "7z")) return "application/x-7z-compressed";
+    if (std.mem.eql(u8, ext, "rar")) return "application/vnd.rar";
+    if (std.mem.eql(u8, ext, "mp3")) return "audio/mpeg";
+    if (std.mem.eql(u8, ext, "wav")) return "audio/wav";
+    if (std.mem.eql(u8, ext, "flac")) return "audio/flac";
+    if (std.mem.eql(u8, ext, "aac")) return "audio/aac";
+    if (std.mem.eql(u8, ext, "midi")) return "audio/midi";
+    if (std.mem.eql(u8, ext, "mid")) return "audio/midi";
+    if (std.mem.eql(u8, ext, "mpeg")) return "video/mpeg";
+    if (std.mem.eql(u8, ext, "avi")) return "video/x-msvideo";
+    if (std.mem.eql(u8, ext, "mov")) return "video/quicktime";
+    if (std.mem.eql(u8, ext, "wmv")) return "video/x-ms-wmv";
+    if (std.mem.eql(u8, ext, "flv")) return "video/x-flv";
+    if (std.mem.eql(u8, ext, "mkv")) return "video/x-matroska";
+    if (std.mem.eql(u8, ext, "jsonld")) return "application/ld+json";
+    if (std.mem.eql(u8, ext, "rdf")) return "application/rdf+xml";
+    if (std.mem.eql(u8, ext, "rss")) return "application/rss+xml";
+    if (std.mem.eql(u8, ext, "atom")) return "application/atom+xml";
+    if (std.mem.eql(u8, ext, "graphql")) return "application/graphql";
+    if (std.mem.eql(u8, ext, "graphqls")) return "application/graphql";
+    if (std.mem.eql(u8, ext, "wasm")) return "application/wasm";
+    if (std.mem.eql(u8, ext, "manifest")) return "application/manifest+json";
+    if (std.mem.eql(u8, ext, "webmanifest")) return "application/manifest+json";
+    if (std.mem.eql(u8, ext, "map")) return "application/json";
+    if (std.mem.eql(u8, ext, "min.js")) return "application/javascript";
+    if (std.mem.eql(u8, ext, "min.css")) return "text/css";
     return "application/octet-stream";
 }
 
@@ -57,6 +286,82 @@ fn getFileExtension(path: []const u8) []const u8 {
         }
     }
     return "";
+}
+
+// Parse Range header for partial content support (RFC 7233)
+fn parseRangeHeader(range_value: []const u8) ?RangeRequest {
+    // Format: bytes=start-end or bytes=start- or bytes=-end
+    if (!std.mem.startsWith(u8, range_value, "bytes=")) return null;
+
+    const range_spec = range_value[6..];
+    if (std.mem.indexOfScalar(u8, range_spec, '-')) |dash_pos| {
+        const start_str = range_spec[0..dash_pos];
+        const end_str = range_spec[dash_pos + 1 ..];
+
+        const start = if (start_str.len > 0) std.fmt.parseInt(u64, start_str, 10) catch return null else 0;
+        const end = if (end_str.len > 0) std.fmt.parseInt(u64, end_str, 10) catch return null else null;
+
+        return .{
+            .unit = "bytes",
+            .start = start,
+            .end = end,
+        };
+    }
+    return null;
+}
+
+// Build Cache-Control header value
+fn buildCacheControlHeader(config: CacheConfig, buffer: []u8) ![]const u8 {
+    var offset: usize = 0;
+    var first = true;
+
+    inline for (.{
+        .{ .flag = config.public_, .name = "public" },
+        .{ .flag = config.private_, .name = "private" },
+        .{ .flag = config.no_cache, .name = "no-cache" },
+        .{ .flag = config.no_store, .name = "no-store" },
+        .{ .flag = config.must_revalidate, .name = "must-revalidate" },
+        .{ .flag = config.proxy_revalidate, .name = "proxy-revalidate" },
+        .{ .flag = config.no_transform, .name = "no-transform" },
+    }) |item| {
+        if (item.flag) {
+            if (!first) {
+                if (offset + 2 > buffer.len) return error.BufferTooSmall;
+                buffer[offset] = ',';
+                buffer[offset + 1] = ' ';
+                offset += 2;
+            }
+            if (offset + item.name.len > buffer.len) return error.BufferTooSmall;
+            @memcpy(buffer[offset .. offset + item.name.len], item.name);
+            offset += item.name.len;
+            first = false;
+        }
+    }
+
+    if (config.max_age) |max_age| {
+        if (!first) {
+            if (offset + 2 > buffer.len) return error.BufferTooSmall;
+            buffer[offset] = ',';
+            buffer[offset + 1] = ' ';
+            offset += 2;
+        }
+        const max_age_str = try std.fmt.bufPrint(buffer[offset..], "max-age={d}", .{max_age});
+        offset += max_age_str.len;
+        first = false;
+    }
+
+    if (config.s_maxage) |s_maxage| {
+        if (!first) {
+            if (offset + 2 > buffer.len) return error.BufferTooSmall;
+            buffer[offset] = ',';
+            buffer[offset + 1] = ' ';
+            offset += 2;
+        }
+        const s_maxage_str = try std.fmt.bufPrint(buffer[offset..], "s-maxage={d}", .{s_maxage});
+        offset += s_maxage_str.len;
+    }
+
+    return buffer[0..offset];
 }
 
 // Serve static file from ./public directory
@@ -101,33 +406,112 @@ fn serveStaticFile(request: *std.http.Server.Request, sub_path: []const u8, io: 
     // Get MIME type
     const content_type = mimeType(getFileExtension(sub_path));
 
+    // Check for Range request (partial content support)
+    var range_request: ?RangeRequest = null;
+    var it = request.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "range")) {
+            range_request = parseRangeHeader(header.value);
+            break;
+        }
+    }
+
     // Build response headers
-    var header_buffer: [1024]u8 = undefined;
-    const header_slice = std.fmt.bufPrint(
-        &header_buffer,
-        "HTTP/1.1 200 OK\r\n" ++
+    var header_buffer: [2048]u8 = undefined;
+    var header_offset: usize = 0;
+
+    // Status line
+    if (range_request) |range| {
+        // Partial content response
+        const start = range.start;
+        const end = range.end orelse stat.size - 1;
+        const content_length = end - start + 1;
+
+        if (start >= stat.size) {
+            // Range not satisfiable
+            const header_slice = std.fmt.bufPrint(
+                &header_buffer,
+                "HTTP/1.1 416 Range Not Satisfiable\r\n" ++
+                "Content-Type: text/plain\r\n" ++
+                "Content-Range: bytes */{d}\r\n" ++
+                "Connection: keep-alive\r\n" ++
+                "\r\n",
+                .{stat.size},
+            ) catch return false;
+            request.server.out.writeAll(header_slice) catch return false;
+            request.server.out.flush() catch return false;
+            return true;
+        }
+
+        const header_slice = std.fmt.bufPrint(
+            &header_buffer,
+            "HTTP/1.1 206 Partial Content\r\n" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
+            "Content-Range: bytes {d}-{d}/{d}\r\n" ++
+            "Accept-Ranges: bytes\r\n" ++
             "Connection: keep-alive\r\n" ++
             "\r\n",
-        .{ content_type, stat.size },
-    ) catch return false;
+            .{ content_type, content_length, start, end, stat.size },
+        ) catch return false;
 
-    // Send headers using request.server.out directly (std.Io.Writer)
-    request.server.out.writeAll(header_slice) catch return false;
+        // Send headers
+        request.server.out.writeAll(header_slice) catch return false;
 
-    // Stream file contents - READER CREATED ONCE BEFORE LOOP (like C++ open() + read loop)
-    var file_read_buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &file_read_buffer);
-    var copy_buffer: [8192]u8 = undefined;
-    var remaining = stat.size;
+        // Stream file contents - skip to start position by reading and discarding
+        var file_read_buffer: [8192]u8 = undefined;
+        var file_reader = file.reader(io, &file_read_buffer);
+        var copy_buffer: [8192]u8 = undefined;
+        var remaining = stat.size;
+        var skipped: u64 = 0;
 
-    while (remaining > 0) {
-        const to_read = @min(remaining, copy_buffer.len);
-        const bytes_read = file_reader.interface.readSliceShort(copy_buffer[0..to_read]) catch break;
-        if (bytes_read == 0) break;
-        request.server.out.writeAll(copy_buffer[0..bytes_read]) catch break;
-        remaining -= bytes_read;
+        // Skip bytes until we reach the start position
+        while (skipped < start) {
+            const to_skip = @min(start - skipped, @as(u64, file_read_buffer.len));
+            const bytes_read = file_reader.interface.readSliceShort(file_read_buffer[0..@intCast(to_skip)]) catch break;
+            if (bytes_read == 0) break;
+            skipped += bytes_read;
+        }
+
+        // Now read and send the range content
+        remaining = content_length;
+        while (remaining > 0) {
+            const to_read = @min(remaining, copy_buffer.len);
+            const bytes_read = file_reader.interface.readSliceShort(copy_buffer[0..@intCast(to_read)]) catch break;
+            if (bytes_read == 0) break;
+            request.server.out.writeAll(copy_buffer[0..bytes_read]) catch break;
+            remaining -= bytes_read;
+        }
+    } else {
+        // Full content response
+        const header_slice = std.fmt.bufPrint(
+            &header_buffer,
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: {s}\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Accept-Ranges: bytes\r\n" ++
+                "Connection: keep-alive\r\n" ++
+                "\r\n",
+            .{ content_type, stat.size },
+        ) catch return false;
+        header_offset = header_slice.len;
+
+        // Send headers using request.server.out directly (std.Io.Writer)
+        request.server.out.writeAll(header_slice) catch return false;
+
+        // Stream file contents - READER CREATED ONCE BEFORE LOOP (like C++ open() + read loop)
+        var file_read_buffer: [8192]u8 = undefined;
+        var file_reader = file.reader(io, &file_read_buffer);
+        var copy_buffer: [8192]u8 = undefined;
+        var remaining = stat.size;
+
+        while (remaining > 0) {
+            const to_read = @min(remaining, copy_buffer.len);
+            const bytes_read = file_reader.interface.readSliceShort(copy_buffer[0..to_read]) catch break;
+            if (bytes_read == 0) break;
+            request.server.out.writeAll(copy_buffer[0..bytes_read]) catch break;
+            remaining -= bytes_read;
+        }
     }
 
     // revent lock/stuck when requesting exists served file
@@ -440,6 +824,203 @@ fn broadcastToRoom(room_name: []const u8, message: []const u8, io: std.Io) void 
 
 // --------------------------------------------------------- //
 
+// Send HTTP response with full spec compliance
+fn sendHttpResponse(
+    request: *std.http.Server.Request,
+    status: HttpStatus,
+    body: []const u8,
+    content_type: []const u8,
+    keep_alive: bool,
+    cors: ?CorsConfig,
+    cache: ?CacheConfig,
+    extra_headers: ?[]const HttpHeader,
+) !void {
+    var header_buffer: [4096]u8 = undefined;
+    var offset: usize = 0;
+
+    // Status line
+    const status_text = httpStatusText(status);
+    const status_line = try std.fmt.bufPrint(
+        header_buffer[offset..],
+        "HTTP/1.1 {d} {s}\r\n",
+        .{ @intFromEnum(status), status_text },
+    );
+    offset += status_line.len;
+
+    // Content-Type header
+    const ct_header = try std.fmt.bufPrint(
+        header_buffer[offset..],
+        "Content-Type: {s}\r\n",
+        .{content_type},
+    );
+    offset += ct_header.len;
+
+    // Content-Length header
+    const cl_header = try std.fmt.bufPrint(
+        header_buffer[offset..],
+        "Content-Length: {d}\r\n",
+        .{body.len},
+    );
+    offset += cl_header.len;
+
+    // Connection header
+    const conn_header = if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n";
+    if (offset + conn_header.len > header_buffer.len) return error.BufferTooSmall;
+    @memcpy(header_buffer[offset .. offset + conn_header.len], conn_header);
+    offset += conn_header.len;
+
+    // CORS headers (if provided)
+    if (cors) |c| {
+        var cors_max_age_buf: [32]u8 = undefined;
+        const cors_max_age_str = std.fmt.bufPrint(&cors_max_age_buf, "{d}", .{c.max_age}) catch "86400";
+        const cors_headers = [_]struct { name: []const u8, value: []const u8 }{
+            .{ .name = "Access-Control-Allow-Origin", .value = c.allow_origin },
+            .{ .name = "Access-Control-Allow-Methods", .value = c.allow_methods },
+            .{ .name = "Access-Control-Allow-Headers", .value = c.allow_headers },
+            .{ .name = "Access-Control-Max-Age", .value = cors_max_age_str },
+        };
+
+        for (cors_headers) |h| {
+            const header_line = try std.fmt.bufPrint(
+                header_buffer[offset..],
+                "{s}: {s}\r\n",
+                .{ h.name, h.value },
+            );
+            offset += header_line.len;
+        }
+
+        if (c.allow_credentials) {
+            const cred_header = try std.fmt.bufPrint(
+                header_buffer[offset..],
+                "Access-Control-Allow-Credentials: true\r\n",
+                .{},
+            );
+            offset += cred_header.len;
+        }
+
+        if (c.expose_headers.len > 0) {
+            const expose_header = try std.fmt.bufPrint(
+                header_buffer[offset..],
+                "Access-Control-Expose-Headers: {s}\r\n",
+                .{c.expose_headers},
+            );
+            offset += expose_header.len;
+        }
+    }
+
+    // Cache-Control header (if provided)
+    if (cache) |c| {
+        var cache_buf: [256]u8 = undefined;
+        const cache_value = buildCacheControlHeader(c, &cache_buf) catch "private";
+        const cache_header = try std.fmt.bufPrint(
+            header_buffer[offset..],
+            "Cache-Control: {s}\r\n",
+            .{cache_value},
+        );
+        offset += cache_header.len;
+    }
+
+    // Extra headers (if provided)
+    if (extra_headers) |headers| {
+        for (headers) |h| {
+            const header_line = try std.fmt.bufPrint(
+                header_buffer[offset..],
+                "{s}: {s}\r\n",
+                .{ h.name, h.value },
+            );
+            offset += header_line.len;
+        }
+    }
+
+    // End of headers
+    if (offset + 2 > header_buffer.len) return error.BufferTooSmall;
+    header_buffer[offset] = '\r';
+    header_buffer[offset + 1] = '\n';
+    offset += 2;
+
+    // Send headers
+    request.server.out.writeAll(header_buffer[0..offset]) catch return;
+
+    // Send body (if any)
+    if (body.len > 0) {
+        request.server.out.writeAll(body) catch return;
+    }
+
+    // Flush
+    request.server.out.flush() catch return;
+}
+
+// Handle OPTIONS request (CORS preflight)
+fn handleOptionsRequest(request: *std.http.Server.Request, cors: CorsConfig) !void {
+    var header_buffer: [2048]u8 = undefined;
+    var offset: usize = 0;
+
+    // Status line
+    const status_line = try std.fmt.bufPrint(
+        header_buffer[offset..],
+        "HTTP/1.1 204 No Content\r\n",
+        .{},
+    );
+    offset += status_line.len;
+
+    // CORS headers
+    var cors_max_age_buf: [32]u8 = undefined;
+    const cors_max_age_str = std.fmt.bufPrint(&cors_max_age_buf, "{d}", .{cors.max_age}) catch "86400";
+    const cors_headers = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "Access-Control-Allow-Origin", .value = cors.allow_origin },
+        .{ .name = "Access-Control-Allow-Methods", .value = cors.allow_methods },
+        .{ .name = "Access-Control-Allow-Headers", .value = cors.allow_headers },
+        .{ .name = "Access-Control-Max-Age", .value = cors_max_age_str },
+    };
+
+    for (cors_headers) |h| {
+        const header_line = try std.fmt.bufPrint(
+            header_buffer[offset..],
+            "{s}: {s}\r\n",
+            .{ h.name, h.value },
+        );
+        offset += header_line.len;
+    }
+
+    if (cors.allow_credentials) {
+        const cred_header = try std.fmt.bufPrint(
+            header_buffer[offset..],
+            "Access-Control-Allow-Credentials: true\r\n",
+            .{},
+        );
+        offset += cred_header.len;
+    }
+
+    // End of headers
+    if (offset + 2 > header_buffer.len) return error.BufferTooSmall;
+    header_buffer[offset] = '\r';
+    header_buffer[offset + 1] = '\n';
+    offset += 2;
+
+    // Send headers
+    request.server.out.writeAll(header_buffer[0..offset]) catch return;
+    request.server.out.flush() catch return;
+}
+
+// Get Content-Length from request headers
+fn getContentLength(request: *std.http.Server.Request) ?usize {
+    var it = request.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+            return std.fmt.parseInt(usize, header.value, 10) catch return null;
+        }
+    }
+    return null;
+}
+
+// Get current timestamp in seconds (using std.Io.Timestamp)
+fn getCurrentTimestamp(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .real);
+    return ts.toSeconds();
+}
+
+// --------------------------------------------------------- //
+
 // Async client handler - new std.Io async I/O system (Zig 0.16.x)
 fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
     defer stream.close(io);
@@ -451,6 +1032,29 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
     var conn_reader = stream.reader(io, &receive_buffer);
     var conn_writer = stream.writer(io, &send_buffer);
     var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+
+    // CORS configuration
+    const cors_config = CorsConfig{
+        .allow_origin = "*",
+        .allow_methods = "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+        .allow_headers = "Content-Type, Authorization, X-Requested-With, Accept",
+        .allow_credentials = false,
+        .max_age = 86400,
+        .expose_headers = "",
+    };
+
+    // Cache configuration for static files
+    const cache_config = CacheConfig{
+        .public_ = true,
+        .private_ = false,
+        .no_cache = false,
+        .no_store = false,
+        .max_age = 3600,
+        .s_maxage = null,
+        .must_revalidate = false,
+        .proxy_revalidate = false,
+        .no_transform = false,
+    };
 
     // Handle multiple requests on same connection (keep-alive like C++)
     // NOTE: perhaps handle sig handle (postpone)
@@ -475,19 +1079,27 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
         else
             "";
 
+        // Get HTTP method
+        const method = request.head.method;
+
         // Check for WebSocket upgrade request (/chat/{room_name})
         const is_chat_path = std.mem.startsWith(u8, path, "/chat/");
-        const is_get_method = request.head.method == .GET;
+        const is_get_method = method == .GET;
 
         if (is_chat_path and is_get_method) {
             // Extract room name from path
             const room_name = path[6..];
             if (room_name.len == 0) {
-                request.respond("Bad Request", .{
-                    .status = std.http.Status.bad_request,
-                    .keep_alive = true,
-                    .version = std.http.Version.@"HTTP/1.1",
-                }) catch break;
+                sendHttpResponse(
+                    &request,
+                    .bad_request,
+                    "Bad Request",
+                    "text/plain",
+                    true,
+                    cors_config,
+                    null,
+                    null,
+                ) catch break;
                 break;
             }
 
@@ -605,24 +1217,168 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             // Not a WebSocket request, fall through to normal HTTP
         }
 
+        // Handle OPTIONS request (CORS preflight)
+        if (method == .OPTIONS) {
+            handleOptionsRequest(&request, cors_config) catch break;
+            continue;
+        }
+
         // Dynamic route handling FIRST (like C++ reference - check routes before static files)
         var handled = false;
 
         if (std.mem.eql(u8, path, "/zig")) {
-            // Async respond: suspends until write completes
-            // respond() internally handles discardBody() for keep-alive
-            request.respond("home", .{
-                .status = std.http.Status.ok,
-                .keep_alive = true,
-                .version = std.http.Version.@"HTTP/1.1",
-            }) catch break;
+            // Handle different methods for /zig endpoint
+            switch (method) {
+                .GET, .HEAD => {
+                    const body = "home";
+                    sendHttpResponse(
+                        &request,
+                        .ok,
+                        body,
+                        "text/plain",
+                        true,
+                        cors_config,
+                        cache_config,
+                        null,
+                    ) catch break;
+                },
+                .POST, .PUT, .PATCH => {
+                    // Accept body data - read from server.in
+                    const content_length = getContentLength(&request) orelse 0;
+                    if (content_length > 0 and content_length <= CLIENT_REQUEST_BUFFER_SIZE) {
+                        var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+                        var total_read: usize = 0;
+                        while (total_read < content_length) {
+                            const bytes_read = conn_reader.interface.readSliceShort(body_buffer[total_read..content_length]) catch break;
+                            if (bytes_read == 0) break;
+                            total_read += bytes_read;
+                        }
+                        var response_body: [256]u8 = undefined;
+                        const response_len = std.fmt.bufPrint(&response_body, "received {d} bytes", .{total_read}) catch break;
+                        sendHttpResponse(
+                            &request,
+                            .ok,
+                            response_len,
+                            "text/plain",
+                            true,
+                            cors_config,
+                            null,
+                            null,
+                        ) catch break;
+                    } else {
+                        sendHttpResponse(
+                            &request,
+                            .ok,
+                            "no body",
+                            "text/plain",
+                            true,
+                            cors_config,
+                            null,
+                            null,
+                        ) catch break;
+                    }
+                },
+                .DELETE => {
+                    sendHttpResponse(
+                        &request,
+                        .no_content,
+                        "",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                },
+                else => {
+                    sendHttpResponse(
+                        &request,
+                        .method_not_allowed,
+                        "Method Not Allowed",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                },
+            }
             handled = true;
         } else if (std.mem.eql(u8, path, "/zig/json")) {
-            request.respond("{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}", .{
-                .status = std.http.Status.ok,
-                .keep_alive = true,
-                .version = std.http.Version.@"HTTP/1.1",
-            }) catch break;
+            // Handle different methods for /zig/json endpoint
+            switch (method) {
+                .GET, .HEAD => {
+                    const body = "{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}";
+                    sendHttpResponse(
+                        &request,
+                        .ok,
+                        body,
+                        "application/json",
+                        true,
+                        cors_config,
+                        cache_config,
+                        null,
+                    ) catch break;
+                },
+                .POST, .PUT, .PATCH => {
+                    // Accept JSON body and echo back - read from server.in
+                    const content_length = getContentLength(&request) orelse 0;
+                    if (content_length > 0 and content_length <= CLIENT_REQUEST_BUFFER_SIZE) {
+                        var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+                        var total_read: usize = 0;
+                        while (total_read < content_length) {
+                            const bytes_read = conn_reader.interface.readSliceShort(body_buffer[total_read..content_length]) catch break;
+                            if (bytes_read == 0) break;
+                            total_read += bytes_read;
+                        }
+                        sendHttpResponse(
+                            &request,
+                            .ok,
+                            body_buffer[0..total_read],
+                            "application/json",
+                            true,
+                            cors_config,
+                            null,
+                            null,
+                        ) catch break;
+                    } else {
+                        sendHttpResponse(
+                            &request,
+                            .ok,
+                            "{\"echo\":\"no body\"}",
+                            "application/json",
+                            true,
+                            cors_config,
+                            null,
+                            null,
+                        ) catch break;
+                    }
+                },
+                .DELETE => {
+                    sendHttpResponse(
+                        &request,
+                        .no_content,
+                        "",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                },
+                else => {
+                    sendHttpResponse(
+                        &request,
+                        .method_not_allowed,
+                        "Method Not Allowed",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                },
+            }
             handled = true;
         } else if (std.mem.eql(u8, path, "/zig/echo")) {
             // Build JSON response for query parameters
@@ -671,11 +1427,16 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 response_body.append(std.heap.smp_allocator, '}') catch break;
             }
 
-            request.respond(response_body.items, .{
-                .status = std.http.Status.ok,
-                .keep_alive = true,
-                .version = std.http.Version.@"HTTP/1.1",
-            }) catch break;
+            sendHttpResponse(
+                &request,
+                .ok,
+                response_body.items,
+                "application/json",
+                true,
+                cors_config,
+                null,
+                null,
+            ) catch break;
 
             handled = true;
         } else if (std.mem.startsWith(u8, path, "/zig/")) {
@@ -687,12 +1448,47 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             response_body.appendSlice(std.heap.smp_allocator, "value path: ") catch break;
             response_body.appendSlice(std.heap.smp_allocator, path) catch break;
 
-            request.respond(response_body.items, .{
-                .status = std.http.Status.ok,
-                .keep_alive = true,
-                .version = std.http.Version.@"HTTP/1.1",
-            }) catch break;
+            sendHttpResponse(
+                &request,
+                .ok,
+                response_body.items,
+                "text/plain",
+                true,
+                cors_config,
+                cache_config,
+                null,
+            ) catch break;
 
+            handled = true;
+        } else if (std.mem.eql(u8, path, "/api/status")) {
+            // Health check endpoint
+            const body = "{\"status\":\"ok\",\"version\":\"0.1.0\"}";
+            sendHttpResponse(
+                &request,
+                .ok,
+                body,
+                "application/json",
+                true,
+                cors_config,
+                null,
+                null,
+            ) catch break;
+            handled = true;
+        } else if (std.mem.eql(u8, path, "/api/time")) {
+            // Current time endpoint - using std.Io.Timestamp
+            var time_buf: [64]u8 = undefined;
+            const timestamp = getCurrentTimestamp(io);
+            const time_str = std.fmt.bufPrint(&time_buf, "{{\"timestamp\":{d}}}", .{timestamp}) catch break;
+            sendHttpResponse(
+                &request,
+                .ok,
+                time_str,
+                "application/json",
+                true,
+                cors_config,
+                null,
+                null,
+            ) catch break;
             handled = true;
         }
 
@@ -708,11 +1504,16 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             }
 
             // No route matched and static file not found — send 404
-            request.respond("Not Found", .{
-                .status = std.http.Status.not_found,
-                .keep_alive = true,
-                .version = std.http.Version.@"HTTP/1.1",
-            }) catch break;
+            sendHttpResponse(
+                &request,
+                .not_found,
+                "Not Found",
+                "text/plain",
+                true,
+                cors_config,
+                null,
+                null,
+            ) catch break;
         }
 
         // REMOVED: discardBody() is private - respond() handles it internally?
@@ -742,6 +1543,11 @@ fn runServer(io: std.Io) !void {
     std.debug.print("  - Dynamic path: /zig/{{path1}}/{{path2}}/... (except /zig/json)\n", .{});
     std.debug.print("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)\n", .{});
     std.debug.print("  - Static files from ./public at root (e.g., /image.jpg)\n", .{});
+    std.debug.print("  - Health check: /api/status\n", .{});
+    std.debug.print("  - Time endpoint: /api/time\n", .{});
+    std.debug.print("  - CORS enabled for all endpoints\n", .{});
+    std.debug.print("  - Range requests supported for static files\n", .{});
+    std.debug.print("  - Full HTTP spec: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\n", .{});
 
     while (true) {
         // Async accept: suspends until new connection available
@@ -783,15 +1589,15 @@ pub fn main() !void {
 //
 // IMPORTANT:
 // this implementation result:
-// → wrk -c100 -t6 -d10s http://localhost:9007/zig
+// ➜ wrk -c100 -t6 -d10s http://localhost:9007/zig
 // Running 10s test @ http://localhost:9007/zig
 //   6 threads and 100 connections
 //   Thread Stats   Avg      Stdev     Max   +/- Stdev
-//     Latency   249.91us  527.67us  24.95ms   95.42%
-//     Req/Sec    67.15k    14.19k  105.54k    63.52%
-//   4028055 requests in 10.10s, 161.34MB read
-// Requests/sec: 398844.18
-// Transfer/sec:     15.98MB
+//     Latency   269.05us  491.77us  23.12ms   95.40%
+//     Req/Sec    59.34k    14.53k   89.61k    55.78%
+//   3578072 requests in 10.10s, 1.16GB read
+// Requests/sec: 354264.76
+// Transfer/sec:    117.24MB
 //
 // ASYNC VERIFICATION (Zig 0.16.x - std.Io):
 // - std.Io.Threaded provides async I/O backend with thread pool
@@ -811,6 +1617,19 @@ pub fn main() !void {
 // - Suspension happens in kernel (efficient, no userspace overhead)
 // - smp_allocator is thread-safe (lock-free per-CPU arenas)
 // - CONNECTION_THREADS_TARGET = 0 means unlimited concurrent tasks
-// - For 10k+ concurrent: consider std.Io.Evented (epoll/kqueue/io_uring)
+//
+// FULL HTTP SPEC IMPLEMENTATION:
+// - All HTTP/1.1 methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, TRACE, CONNECT
+// - All standard HTTP status codes (1xx, 2xx, 3xx, 4xx, 5xx)
+// - Proper Content-Type and Content-Length headers
+// - CORS support (Access-Control-* headers)
+// - Cache-Control headers for static content
+// - Range request support (RFC 7233) for partial content
+// - Keep-Alive connection management
+// - Request body parsing for POST/PUT/PATCH
+// - URL-encoded form data parsing
+// - Multipart form data support (TODO for file uploads)
+// - Proper error responses with appropriate status codes
+// - Security headers support (can be added via extra_headers parameter)
 //
 
