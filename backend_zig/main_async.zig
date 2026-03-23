@@ -432,10 +432,10 @@ fn serveStaticFile(request: *std.http.Server.Request, sub_path: []const u8, io: 
             const header_slice = std.fmt.bufPrint(
                 &header_buffer,
                 "HTTP/1.1 416 Range Not Satisfiable\r\n" ++
-                "Content-Type: text/plain\r\n" ++
-                "Content-Range: bytes */{d}\r\n" ++
-                "Connection: keep-alive\r\n" ++
-                "\r\n",
+                    "Content-Type: text/plain\r\n" ++
+                    "Content-Range: bytes */{d}\r\n" ++
+                    "Connection: keep-alive\r\n" ++
+                    "\r\n",
                 .{stat.size},
             ) catch return false;
             request.server.out.writeAll(header_slice) catch return false;
@@ -446,12 +446,12 @@ fn serveStaticFile(request: *std.http.Server.Request, sub_path: []const u8, io: 
         const header_slice = std.fmt.bufPrint(
             &header_buffer,
             "HTTP/1.1 206 Partial Content\r\n" ++
-            "Content-Type: {s}\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Content-Range: bytes {d}-{d}/{d}\r\n" ++
-            "Accept-Ranges: bytes\r\n" ++
-            "Connection: keep-alive\r\n" ++
-            "\r\n",
+                "Content-Type: {s}\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Content-Range: bytes {d}-{d}/{d}\r\n" ++
+                "Accept-Ranges: bytes\r\n" ++
+                "Connection: keep-alive\r\n" ++
+                "\r\n",
             .{ content_type, content_length, start, end, stat.size },
         ) catch return false;
 
@@ -1124,7 +1124,8 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
 
                 // Send handshake response
                 var handshake_response: [512]u8 = undefined;
-                const handshake_slice = std.fmt.bufPrint(&handshake_response,
+                const handshake_slice = std.fmt.bufPrint(
+                    &handshake_response,
                     "HTTP/1.1 101 Switching Protocols\r\n" ++
                         "Upgrade: websocket\r\n" ++
                         "Connection: Upgrade\r\n" ++
@@ -1632,4 +1633,3 @@ pub fn main() !void {
 // - Proper error responses with appropriate status codes
 // - Security headers support (can be added via extra_headers parameter)
 //
-
