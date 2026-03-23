@@ -10,8 +10,17 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
 //
 // NOTE:
-// TESTED in: zig 0.16.0-dev.2974+83c7aba12
-// consider std.Io.Evented (epoll/kqueue/io_uring) for more burst/high concurrent
+// TESTED with: zig 0.16.0-dev.2974+83c7aba12
+// consider std.Io.Evented (epoll/kqueue/io_uring) for more burst/high concurrent,
+// but I'm not sure for the next steps for specific platform ()
+//
+
+//
+// STATUS:
+// The current server uses threaded async I/O via Zig’s new std.Io.Threaded
+// tt’s not purely blocking I/O nor pure epoll/kqueue/io_uring; it’s a hybrid,
+// so i'ts asynchronous I/O but using a higher-level abstraction
+// than directly using epoll/kqueue/io_uring.
 //
 
 //
@@ -20,7 +29,7 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 // [X] websocket support
 // [X] keep-alive (manual)
 // [X] dynamic path routing
-// [X] blocking I/O (not epoll)
+// [X] hybrid I/O
 // [X] query parameters parsing
 // [X] multi-threaded http server
 // [X] threadpool for scalability
@@ -2004,3 +2013,4 @@ pub fn main() !void {
 // Response format:
 // {"files":[{"name":"file.txt","size":1024,"path":"./public/u/file.txt"}],"fields":{"description":"My test file"}}
 //
+
