@@ -2,18 +2,20 @@ const std = @import("std");
 
 const ADDRESS_IP: []const u8 = "0.0.0.0";
 const ADDRESS_PORT: u16 = 9007;
-const CONNECTION_THREADS_TARGET: usize = 0;
+const WORKER_THREADS_TARGET: usize = 0;
+
 const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
 // --------------------------------------------------------- //
 
+//
 // NOTE:
 // TESTED in: zig 0.16.0-dev.2974+83c7aba12
 // consider std.Io.Evented (epoll/kqueue/io_uring) for more burst/high concurrent
 //
 
 //
-// TODO:
+// CHECKMARKS:
 // [X] full http spec
 // [X] websocket support
 // [X] keep-alive (manual)
@@ -25,7 +27,7 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 // [X] async / non-blocking server (std.Io)
 // [X] dynamic thread count (hardware_concurrency)
 // [X] public file access, from `$(pwd)/public` relative from the exec run
-// [?] able upload file multiples `$(pwd)/public/u` relative from the exec run
+// [X] able upload file multiples `$(pwd)/public/u` relative from the exec run
 //
 
 // --------------------------------------------------------- //
@@ -221,6 +223,150 @@ const RangeRequest = struct {
     end: ?u64,
 };
 
+// Multipart Form Data Field (for file upload with extra JSON payload)
+const MultipartField = struct {
+    name: []const u8,
+    filename: ?[]const u8,
+    content_type: ?[]const u8,
+    data: []const u8,
+    is_file: bool,
+};
+
+// Multipart Form Data Parser State
+const MultipartParser = struct {
+    boundary: []const u8,
+    fields: std.ArrayList(MultipartField),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator, boundary: []const u8) MultipartParser {
+        return .{
+            .boundary = boundary,
+            .fields = .empty,
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *MultipartParser) void {
+        for (self.fields.items) |field| {
+            if (field.is_file) {
+                self.allocator.free(field.data);
+            }
+        }
+        self.fields.deinit(self.allocator);
+    }
+
+    fn parse(self: *MultipartParser, body: []const u8) !void {
+        // Allocate boundary strings
+        const boundary_start = try self.allocator.alloc(u8, self.boundary.len + 4);
+        defer self.allocator.free(boundary_start);
+        boundary_start[0] = '-';
+        boundary_start[1] = '-';
+        @memcpy(boundary_start[2..][0..self.boundary.len], self.boundary);
+        boundary_start[2 + self.boundary.len] = '\r';
+        boundary_start[2 + self.boundary.len + 1] = '\n';
+
+        const boundary_end = try self.allocator.alloc(u8, self.boundary.len + 6);
+        defer self.allocator.free(boundary_end);
+        boundary_end[0] = '-';
+        boundary_end[1] = '-';
+        @memcpy(boundary_end[2..][0..self.boundary.len], self.boundary);
+        boundary_end[2 + self.boundary.len] = '-';
+        boundary_end[2 + self.boundary.len + 1] = '-';
+        boundary_end[2 + self.boundary.len + 2] = '\r';
+        boundary_end[2 + self.boundary.len + 3] = '\n';
+
+        var start: usize = 0;
+        // Find first boundary line
+        const first_boundary_pos = std.mem.indexOf(u8, body, boundary_start) orelse return;
+        start = first_boundary_pos + boundary_start.len;
+
+        while (start < body.len) {
+            // Look for next boundary (start or end)
+            const next_start_pos = std.mem.indexOf(u8, body[start..], boundary_start);
+            const next_end_pos = std.mem.indexOf(u8, body[start..], boundary_end);
+            const next_boundary_pos = if (next_start_pos != null and next_end_pos != null)
+                @min(next_start_pos.?, next_end_pos.?)
+            else if (next_start_pos != null)
+                next_start_pos.?
+            else if (next_end_pos != null)
+                next_end_pos.?
+            else
+                break; // No more boundaries
+
+            const part_data = body[start .. start + next_boundary_pos];
+
+            // Parse headers and content
+            const header_end = std.mem.indexOf(u8, part_data, "\r\n\r\n") orelse {
+                start = start + next_boundary_pos + (if (next_start_pos != null and next_start_pos.? == next_boundary_pos) boundary_start.len else boundary_end.len);
+                continue;
+            };
+            const headers = part_data[0..header_end];
+            const content = part_data[header_end + 4 ..];
+
+            var field_name: ?[]const u8 = null;
+            var field_filename: ?[]const u8 = null;
+            var field_content_type: ?[]const u8 = null;
+
+            var header_it = std.mem.splitScalar(u8, headers, '\n');
+            while (header_it.next()) |header_line| {
+                const trimmed = std.mem.trim(u8, header_line, "\r\n ");
+                if (std.mem.startsWith(u8, trimmed, "Content-Disposition:")) {
+                    const disp_value = trimmed["Content-Disposition:".len..];
+                    if (std.mem.indexOf(u8, disp_value, "name=\"")) |name_start| {
+                        const name_val_start = name_start + 6;
+                        if (std.mem.indexOf(u8, disp_value[name_val_start..], "\"")) |name_end| {
+                            field_name = disp_value[name_val_start..][0..name_end];
+                        }
+                    }
+                    if (std.mem.indexOf(u8, disp_value, "filename=\"")) |fname_start| {
+                        const fname_val_start = fname_start + 10;
+                        if (std.mem.indexOf(u8, disp_value[fname_val_start..], "\"")) |fname_end| {
+                            field_filename = disp_value[fname_val_start..][0..fname_end];
+                        }
+                    }
+                } else if (std.mem.startsWith(u8, trimmed, "Content-Type:")) {
+                    field_content_type = std.mem.trim(u8, trimmed["Content-Type:".len..], " \r\n");
+                }
+            }
+
+            if (field_name) |name| {
+                const field_data = if (field_filename != null)
+                    try self.allocator.dupe(u8, std.mem.trim(u8, content, "\r\n"))
+                else
+                    std.mem.trim(u8, content, "\r\n");
+
+                try self.fields.append(self.allocator, .{
+                    .name = name,
+                    .filename = field_filename,
+                    .content_type = field_content_type,
+                    .data = field_data,
+                    .is_file = (field_filename != null),
+                });
+            }
+
+            // Move to next part
+            start = start + next_boundary_pos + (if (next_start_pos != null and next_start_pos.? == next_boundary_pos) boundary_start.len else boundary_end.len);
+            if (next_start_pos == null and next_end_pos != null) break; // Reached final boundary
+        }
+    }
+
+    fn getField(self: *MultipartParser, name: []const u8) ?*MultipartField {
+        for (self.fields.items) |*field| {
+            if (std.mem.eql(u8, field.name, name)) {
+                return field;
+            }
+        }
+        return null;
+    }
+
+    fn getFieldByIndex(self: *MultipartParser, index: usize) ?*MultipartField {
+        if (index < self.fields.items.len) {
+            return &self.fields.items[index];
+        }
+        return null;
+    }
+};
+
 // MIME type mapping for static files
 fn mimeType(ext: []const u8) []const u8 {
     if (std.mem.eql(u8, ext, "html")) return "text/html";
@@ -275,6 +421,7 @@ fn mimeType(ext: []const u8) []const u8 {
     if (std.mem.eql(u8, ext, "map")) return "application/json";
     if (std.mem.eql(u8, ext, "min.js")) return "application/javascript";
     if (std.mem.eql(u8, ext, "min.css")) return "text/css";
+
     return "application/octet-stream";
 }
 
@@ -285,6 +432,7 @@ fn getFileExtension(path: []const u8) []const u8 {
             return path[dot_pos + 1 ..];
         }
     }
+
     return "";
 }
 
@@ -297,16 +445,15 @@ fn parseRangeHeader(range_value: []const u8) ?RangeRequest {
     if (std.mem.indexOfScalar(u8, range_spec, '-')) |dash_pos| {
         const start_str = range_spec[0..dash_pos];
         const end_str = range_spec[dash_pos + 1 ..];
-
         const start = if (start_str.len > 0) std.fmt.parseInt(u64, start_str, 10) catch return null else 0;
         const end = if (end_str.len > 0) std.fmt.parseInt(u64, end_str, 10) catch return null else null;
-
         return .{
             .unit = "bytes",
             .start = start,
             .end = end,
         };
     }
+
     return null;
 }
 
@@ -504,7 +651,6 @@ fn serveStaticFile(request: *std.http.Server.Request, sub_path: []const u8, io: 
         var file_reader = file.reader(io, &file_read_buffer);
         var copy_buffer: [8192]u8 = undefined;
         var remaining = stat.size;
-
         while (remaining > 0) {
             const to_read = @min(remaining, copy_buffer.len);
             const bytes_read = file_reader.interface.readSliceShort(copy_buffer[0..to_read]) catch break;
@@ -518,6 +664,34 @@ fn serveStaticFile(request: *std.http.Server.Request, sub_path: []const u8, io: 
     request.server.out.flush() catch return false;
 
     return true;
+}
+
+// Save uploaded file to ./public/u directory
+fn saveUploadedFile(io: std.Io, filename: []const u8, data: []const u8) ![]const u8 {
+    const upload_dir = "./public/u";
+    // FIX: std.Io.Dir.createDirPath instead of makePath
+    std.Io.Dir.cwd().createDirPath(io, upload_dir) catch {};
+
+    var full_path_buf: [512]u8 = undefined;
+    if (upload_dir.len + 1 + filename.len > full_path_buf.len) {
+        return error.PathTooLong;
+    }
+    @memcpy(full_path_buf[0..upload_dir.len], upload_dir);
+    full_path_buf[upload_dir.len] = '/';
+    @memcpy(full_path_buf[upload_dir.len + 1 ..][0..filename.len], filename);
+    const full_path = full_path_buf[0 .. upload_dir.len + 1 + filename.len];
+
+    const file = try std.Io.Dir.cwd().createFile(io, full_path, .{});
+    defer file.close(io);
+
+    // FIX: file.writer() requires 3 parameters: file, io, buffer
+    // FIX: writer.writeAll() doesn't exist - use writer.interface.writeAll()
+    var write_buffer: [8192]u8 = undefined;
+    var writer = file.writer(io, &write_buffer);
+    try writer.interface.writeAll(data);
+    try writer.interface.flush();
+
+    return full_path;
 }
 
 // --------------------------------------------------------- //
@@ -561,6 +735,7 @@ const WebSocketFrame = struct {
 // Parse WebSocket frame from buffer
 fn parseWebSocketFrame(data: []const u8) ?struct { frame: WebSocketFrame, consumed: usize } {
     if (data.len < 2) return null;
+
     var offset: usize = 0;
 
     // First byte: FIN + RSV + Opcode
@@ -579,15 +754,11 @@ fn parseWebSocketFrame(data: []const u8) ?struct { frame: WebSocketFrame, consum
     // Extended payload length
     if (payload_length == 126) {
         if (data.len < offset + 2) return null;
-
         payload_length = @as(u64, data[offset]) << 8 | data[offset + 1];
-
         offset += 2;
     } else if (payload_length == 127) {
         if (data.len < offset + 8) return null;
-
         payload_length = 0;
-
         for (0..8) |i| {
             payload_length = (payload_length << 8) | data[offset + i];
         }
@@ -606,7 +777,6 @@ fn parseWebSocketFrame(data: []const u8) ?struct { frame: WebSocketFrame, consum
 
     // Payload
     if (data.len < offset + payload_length) return null;
-
     const payload_start = offset;
     const payload_end = offset + payload_length;
 
@@ -618,7 +788,6 @@ fn parseWebSocketFrame(data: []const u8) ?struct { frame: WebSocketFrame, consum
         }
         break :blk unmasked_payload[0..payload_length];
     } else data[payload_start..payload_end];
-
     offset = payload_end;
 
     return .{
@@ -685,12 +854,14 @@ fn computeWebSocketAccept(key: []const u8, buffer: *[64]u8) ![]const u8 {
     // Base64 encode
     const base64_encoder = std.base64.standard.Encoder;
     const encoded_len = base64_encoder.calcSize(20);
+
     return base64_encoder.encode(buffer[0..encoded_len], &hash);
 }
 
 // Add connection to room
 fn addConnectionToRoom(room_name: []const u8, conn: *WebSocketConnection, io: std.Io) void {
     g_rooms_mutex.lock(io) catch return;
+
     defer g_rooms_mutex.unlock(io);
 
     const gop = g_websocket_rooms.getOrPut(room_name) catch return;
@@ -700,7 +871,6 @@ fn addConnectionToRoom(room_name: []const u8, conn: *WebSocketConnection, io: st
             .mutex = .init,
         };
     }
-
     gop.value_ptr.mutex.lock(io) catch return;
     defer gop.value_ptr.mutex.unlock(io);
 
@@ -715,7 +885,6 @@ fn addConnectionToRoom(room_name: []const u8, conn: *WebSocketConnection, io: st
 fn removeConnectionFromRoom(room_name: []const u8, conn: *WebSocketConnection, io: std.Io) void {
     g_rooms_mutex.lock(io) catch return;
     defer g_rooms_mutex.unlock(io);
-
     if (g_websocket_rooms.getPtr(room_name)) |room| {
         room.mutex.lock(io) catch return;
 
@@ -756,6 +925,7 @@ fn removeConnectionFromRoom(room_name: []const u8, conn: *WebSocketConnection, i
 // Broadcast message to all connections in a room
 fn broadcastToRoom(room_name: []const u8, message: []const u8, io: std.Io) void {
     g_rooms_mutex.lock(io) catch return;
+
     defer g_rooms_mutex.unlock(io);
 
     if (g_websocket_rooms.getPtr(room_name)) |room| {
@@ -861,6 +1031,7 @@ fn sendHttpResponse(
         "Content-Length: {d}\r\n",
         .{body.len},
     );
+
     offset += cl_header.len;
 
     // Connection header
@@ -940,7 +1111,6 @@ fn sendHttpResponse(
 
     // Send headers
     request.server.out.writeAll(header_buffer[0..offset]) catch return;
-
     // Send body (if any)
     if (body.len > 0) {
         request.server.out.writeAll(body) catch return;
@@ -954,13 +1124,13 @@ fn sendHttpResponse(
 fn handleOptionsRequest(request: *std.http.Server.Request, cors: CorsConfig) !void {
     var header_buffer: [2048]u8 = undefined;
     var offset: usize = 0;
-
     // Status line
     const status_line = try std.fmt.bufPrint(
         header_buffer[offset..],
         "HTTP/1.1 204 No Content\r\n",
         .{},
     );
+
     offset += status_line.len;
 
     // CORS headers
@@ -1009,6 +1179,26 @@ fn getContentLength(request: *std.http.Server.Request) ?usize {
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
             return std.fmt.parseInt(usize, header.value, 10) catch return null;
         }
+    }
+    return null;
+}
+
+// Get Content-Type from request headers
+fn getContentType(request: *std.http.Server.Request) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+            return header.value;
+        }
+    }
+    return null;
+}
+
+// Extract boundary from Content-Type header for multipart/form-data
+fn extractBoundary(content_type: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, content_type, "multipart/form-data")) return null;
+    if (std.mem.indexOf(u8, content_type, "boundary=")) |boundary_pos| {
+        return content_type[boundary_pos + 9 ..];
     }
     return null;
 }
@@ -1065,7 +1255,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             if (err == error.ConnectionResetByPeer) break;
             break;
         };
-
         const full_path = request.head.target;
 
         // Split path and query string
@@ -1073,7 +1262,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             full_path[0..qpos]
         else
             full_path;
-
         const query = if (std.mem.indexOfScalar(u8, full_path, '?')) |qpos|
             full_path[qpos + 1 ..]
         else
@@ -1085,7 +1273,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
         // Check for WebSocket upgrade request (/chat/{room_name})
         const is_chat_path = std.mem.startsWith(u8, path, "/chat/");
         const is_get_method = method == .GET;
-
         if (is_chat_path and is_get_method) {
             // Extract room name from path
             const room_name = path[6..];
@@ -1114,7 +1301,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                     sec_ws_key = header.value;
                 }
             }
-
             if (is_upgrade and sec_ws_key != null) {
                 // Perform WebSocket handshake
                 var accept_buffer: [64]u8 = undefined;
@@ -1170,7 +1356,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                         const result = parseWebSocketFrame(frame_buffer[offset..]) orelse break;
                         const frame = result.frame;
                         const consumed = result.consumed;
-
                         // Handle different opcodes
                         switch (frame.opcode) {
                             .text, .binary => {
@@ -1215,6 +1400,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 removeConnectionFromRoom(room_name, ws_conn, io);
                 break;
             }
+
             // Not a WebSocket request, fall through to normal HTTP
         }
 
@@ -1226,7 +1412,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
 
         // Dynamic route handling FIRST (like C++ reference - check routes before static files)
         var handled = false;
-
         if (std.mem.eql(u8, path, "/zig")) {
             // Handle different methods for /zig endpoint
             switch (method) {
@@ -1304,6 +1489,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                     ) catch break;
                 },
             }
+
             handled = true;
         } else if (std.mem.eql(u8, path, "/zig/json")) {
             // Handle different methods for /zig/json endpoint
@@ -1380,13 +1566,15 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                     ) catch break;
                 },
             }
+
             handled = true;
         } else if (std.mem.eql(u8, path, "/zig/echo")) {
             // Build JSON response for query parameters
             var response_body: std.ArrayList(u8) = .empty;
             defer response_body.deinit(std.heap.smp_allocator);
+
             if (query.len == 0) {
-                // No params — return null
+                // No params → return null
                 response_body.appendSlice(std.heap.smp_allocator, "null") catch break;
             } else {
                 // All params as JSON object
@@ -1396,18 +1584,14 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 while (pos < query.len) {
                     const amp_pos = std.mem.indexOfScalarPos(u8, query, pos, '&') orelse query.len;
                     const pair = query[pos..amp_pos];
-
                     if (std.mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
                         const key = pair[0..eq_pos];
                         const val = pair[eq_pos + 1 ..];
-
                         if (!first) response_body.appendSlice(std.heap.smp_allocator, ",") catch break;
-
                         first = false;
                         response_body.append(std.heap.smp_allocator, '"') catch break;
                         response_body.appendSlice(std.heap.smp_allocator, key) catch break;
                         response_body.appendSlice(std.heap.smp_allocator, "\":") catch break;
-
                         if (val.len == 0) {
                             response_body.appendSlice(std.heap.smp_allocator, "null") catch break;
                         } else {
@@ -1417,14 +1601,15 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                         }
                     } else {
                         if (!first) response_body.appendSlice(std.heap.smp_allocator, ",") catch break;
-
                         first = false;
                         response_body.append(std.heap.smp_allocator, '"') catch break;
                         response_body.appendSlice(std.heap.smp_allocator, pair) catch break;
                         response_body.appendSlice(std.heap.smp_allocator, "\":null") catch break;
                     }
+
                     pos = amp_pos + 1;
                 }
+
                 response_body.append(std.heap.smp_allocator, '}') catch break;
             }
 
@@ -1440,6 +1625,165 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             ) catch break;
 
             handled = true;
+        } else if (std.mem.eql(u8, path, "/zig/upload")) {
+            // Handle multipart/form-data file upload
+            if (method == .POST) {
+                const content_type = getContentType(&request) orelse {
+                    sendHttpResponse(
+                        &request,
+                        .bad_request,
+                        "Content-Type header required",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                    handled = true;
+                    continue;
+                };
+
+                const boundary = extractBoundary(content_type) orelse {
+                    sendHttpResponse(
+                        &request,
+                        .bad_request,
+                        "Invalid multipart/form-data Content-Type",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                    handled = true;
+                    continue;
+                };
+
+                const content_length = getContentLength(&request) orelse 0;
+                if (content_length == 0 or content_length > CLIENT_REQUEST_BUFFER_SIZE) {
+                    sendHttpResponse(
+                        &request,
+                        .payload_too_large,
+                        "Payload too large",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                    handled = true;
+                    continue;
+                }
+
+                var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+                var total_read: usize = 0;
+                while (total_read < content_length) {
+                    const bytes_read = conn_reader.interface.readSliceShort(body_buffer[total_read..content_length]) catch break;
+                    if (bytes_read == 0) break;
+                    total_read += bytes_read;
+                }
+                var parser = MultipartParser.init(std.heap.smp_allocator, boundary);
+                defer parser.deinit();
+
+                parser.parse(body_buffer[0..total_read]) catch {
+                    sendHttpResponse(
+                        &request,
+                        .bad_request,
+                        "Failed to parse multipart data",
+                        "text/plain",
+                        true,
+                        cors_config,
+                        null,
+                        null,
+                    ) catch break;
+                    handled = true;
+                    continue;
+                };
+
+                var response_json: std.ArrayList(u8) = .empty;
+                defer response_json.deinit(std.heap.smp_allocator);
+
+                response_json.appendSlice(std.heap.smp_allocator, "{\"files\":[") catch break;
+                var first_file = true;
+                var i: usize = 0;
+                while (i < parser.fields.items.len) : (i += 1) {
+                    const field = &parser.fields.items[i];
+
+                    if (field.is_file) {
+                        const saved_path = saveUploadedFile(io, field.filename.?, field.data) catch {
+                            sendHttpResponse(
+                                &request,
+                                .internal_server_error,
+                                "Failed to save file",
+                                "text/plain",
+                                true,
+                                cors_config,
+                                null,
+                                null,
+                            ) catch break;
+                            handled = true;
+                            continue;
+                        };
+
+                        if (!first_file) response_json.appendSlice(std.heap.smp_allocator, ",") catch break;
+                        first_file = false;
+                        var file_entry: [512]u8 = undefined;
+                        const entry_slice = std.fmt.bufPrint(&file_entry, "{{\"name\":\"{s}\",\"size\":{d},\"path\":\"{s}\"}}", .{
+                            field.filename.?,
+                            field.data.len,
+                            saved_path,
+                        }) catch break;
+
+                        response_json.appendSlice(std.heap.smp_allocator, entry_slice) catch break;
+                    }
+                }
+
+                response_json.appendSlice(std.heap.smp_allocator, "],\"fields\":") catch break;
+
+                // Add non-file fields as JSON object
+                response_json.append(std.heap.smp_allocator, '{') catch break;
+                var first_field = true;
+                i = 0;
+                while (i < parser.fields.items.len) : (i += 1) {
+                    const field = &parser.fields.items[i];
+                    if (!field.is_file) {
+                        if (!first_field) response_json.appendSlice(std.heap.smp_allocator, ",") catch break;
+                        first_field = false;
+                        response_json.append(std.heap.smp_allocator, '"') catch break;
+                        response_json.appendSlice(std.heap.smp_allocator, field.name) catch break;
+                        response_json.appendSlice(std.heap.smp_allocator, "\":\"") catch break;
+                        response_json.appendSlice(std.heap.smp_allocator, field.data) catch break;
+                        response_json.append(std.heap.smp_allocator, '"') catch break;
+                    }
+                }
+
+                response_json.appendSlice(std.heap.smp_allocator, "}}") catch break;
+
+                sendHttpResponse(
+                    &request,
+                    .ok,
+                    response_json.items,
+                    "application/json",
+                    true,
+                    cors_config,
+                    null,
+                    null,
+                ) catch break;
+
+                handled = true;
+            } else {
+                sendHttpResponse(
+                    &request,
+                    .method_not_allowed,
+                    "Method Not Allowed",
+                    "text/plain",
+                    true,
+                    cors_config,
+                    null,
+                    null,
+                ) catch break;
+
+                handled = true;
+            }
         } else if (std.mem.startsWith(u8, path, "/zig/")) {
             // Dynamic path routing: /zig/{path1}/{path2}/...
             var response_body: std.ArrayList(u8) = .empty;
@@ -1464,6 +1808,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
         } else if (std.mem.eql(u8, path, "/api/status")) {
             // Health check endpoint
             const body = "{\"status\":\"ok\",\"version\":\"0.1.0\"}";
+
             sendHttpResponse(
                 &request,
                 .ok,
@@ -1474,12 +1819,14 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 null,
                 null,
             ) catch break;
+
             handled = true;
         } else if (std.mem.eql(u8, path, "/api/time")) {
             // Current time endpoint - using std.Io.Timestamp
             var time_buf: [64]u8 = undefined;
             const timestamp = getCurrentTimestamp(io);
             const time_str = std.fmt.bufPrint(&time_buf, "{{\"timestamp\":{d}}}", .{timestamp}) catch break;
+
             sendHttpResponse(
                 &request,
                 .ok,
@@ -1490,6 +1837,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 null,
                 null,
             ) catch break;
+
             handled = true;
         }
 
@@ -1504,7 +1852,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
                 }
             }
 
-            // No route matched and static file not found — send 404
+            // No route matched and static file not found → send 404
             sendHttpResponse(
                 &request,
                 .not_found,
@@ -1544,6 +1892,7 @@ fn runServer(io: std.Io) !void {
     std.debug.print("  - Dynamic path: /zig/{{path1}}/{{path2}}/... (except /zig/json)\n", .{});
     std.debug.print("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)\n", .{});
     std.debug.print("  - Static files from ./public at root (e.g., /image.jpg)\n", .{});
+    std.debug.print("  - File upload: /zig/upload (multipart/form-data) → ./public/u\n", .{});
     std.debug.print("  - Health check: /api/status\n", .{});
     std.debug.print("  - Time endpoint: /api/time\n", .{});
     std.debug.print("  - CORS enabled for all endpoints\n", .{});
@@ -1569,11 +1918,11 @@ fn runServer(io: std.Io) !void {
 // --------------------------------------------------------- //
 
 pub fn main() !void {
-    // Thread count configuration: 0 = all threads, >0 = specific count
-    const concurrent_limit: std.Io.Limit = if (CONNECTION_THREADS_TARGET == 0)
+    // Thread count configuration: 0 = all threads, greater than 0 = specific count
+    const concurrent_limit: std.Io.Limit = if (WORKER_THREADS_TARGET == 0)
         .unlimited
     else
-        .{ .limited = CONNECTION_THREADS_TARGET };
+        .{ .limited = WORKER_THREADS_TARGET };
 
     // Threaded I/O with concurrent task support - new std.Io async system
     // async_limit auto-detected from CPU count if not specified
@@ -1590,7 +1939,7 @@ pub fn main() !void {
 //
 // IMPORTANT:
 // this implementation result:
-// ➜ wrk -c100 -t6 -d10s http://localhost:9007/zig
+// →  wrk -c100 -t6 -d10s http://localhost:9007/zig
 // Running 10s test @ http://localhost:9007/zig
 //   6 threads and 100 connections
 //   Thread Stats   Avg      Stdev     Max   +/- Stdev
@@ -1617,7 +1966,7 @@ pub fn main() !void {
 // - M:N scheduling (many tasks, fewer threads)
 // - Suspension happens in kernel (efficient, no userspace overhead)
 // - smp_allocator is thread-safe (lock-free per-CPU arenas)
-// - CONNECTION_THREADS_TARGET = 0 means unlimited concurrent tasks
+// - WORKER_THREADS_TARGET = 0 means unlimited concurrent tasks
 //
 // FULL HTTP SPEC IMPLEMENTATION:
 // - All HTTP/1.1 methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, TRACE, CONNECT
@@ -1629,7 +1978,29 @@ pub fn main() !void {
 // - Keep-Alive connection management
 // - Request body parsing for POST/PUT/PATCH
 // - URL-encoded form data parsing
-// - Multipart form data support (TODO for file uploads)
+// - Multipart form data support (file uploads to ./public/u)
 // - Proper error responses with appropriate status codes
 // - Security headers support (can be added via extra_headers parameter)
+//
+// CURL EXAMPLES FOR FILE UPLOAD:
+//
+// 1. Upload single file with extra JSON field:
+//    curl -X POST http://localhost:9007/zig/upload \
+//      -F "file=@/path/to/file.txt" \
+//      -F "description=My test file"
+//
+// 2. Upload multiple files:
+//    curl -X POST http://localhost:9007/zig/upload \
+//      -F "file1=@/path/to/file1.png" \
+//      -F "file2=@/path/to/file2.jpg" \
+//      -F "title=Multiple Upload"
+//
+// 3. Upload with metadata (check by index):
+//    curl -X POST http://localhost:9007/zig/upload \
+//      -F "document=@/path/to/doc.pdf" \
+//      -F "author=John Doe" \
+//      -F "category=reports"
+//
+// Response format:
+// {"files":[{"name":"file.txt","size":1024,"path":"./public/u/file.txt"}],"fields":{"description":"My test file"}}
 //
