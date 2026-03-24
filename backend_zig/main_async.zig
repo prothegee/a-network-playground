@@ -18,7 +18,7 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 //
 // STATUS:
 // The current server uses threaded async I/O via Zig’s new std.Io.Threaded
-// tt’s not purely blocking I/O nor pure epoll/kqueue/io_uring; it’s a hybrid,
+// it’s not purely blocking I/O nor pure epoll/kqueue/io_uring; it’s a hybrid,
 // so i'ts asynchronous I/O but using a higher-level abstraction
 // than directly using epoll/kqueue/io_uring.
 //
