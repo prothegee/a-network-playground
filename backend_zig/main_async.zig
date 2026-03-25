@@ -10,7 +10,7 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
 //
 // NOTE:
-// TESTED with: zig 0.16.0-dev.2974+83c7aba12
+// TESTED with: zig 0.16.0-dev.3006+94355f192
 // consider std.Io.Evented (epoll/kqueue/io_uring) for more burst/high concurrent,
 // but I'm not sure for the next steps for specific platform ()
 //
@@ -1948,15 +1948,15 @@ pub fn main() !void {
 //
 // IMPORTANT:
 // this implementation result:
-// →  wrk -c100 -t6 -d10s http://localhost:9007/zig
+// ➜ wrk -c100 -t6 -d10s http://localhost:9007/zig
 // Running 10s test @ http://localhost:9007/zig
 //   6 threads and 100 connections
 //   Thread Stats   Avg      Stdev     Max   +/- Stdev
-//     Latency   269.05us  491.77us  23.12ms   95.40%
-//     Req/Sec    59.34k    14.53k   89.61k    55.78%
-//   3578072 requests in 10.10s, 1.16GB read
-// Requests/sec: 354264.76
-// Transfer/sec:    117.24MB
+//     Latency   325.98us  655.33us  25.67ms   93.43%
+//     Req/Sec    61.26k    14.91k  135.91k    71.55%
+//   3663322 requests in 10.10s, 1.18GB read
+// Requests/sec: 362732.80
+// Transfer/sec:    120.04MB
 //
 // ASYNC VERIFICATION (Zig 0.16.x - std.Io):
 // - std.Io.Threaded provides async I/O backend with thread pool
