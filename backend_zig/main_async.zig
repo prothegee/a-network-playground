@@ -25,11 +25,12 @@ const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
 //
 // CHECKMARKS:
+// [X] hybrid I/O
 // [X] full http spec
 // [X] websocket support
 // [X] keep-alive (manual)
 // [X] dynamic path routing
-// [X] hybrid I/O
+// [X] controller middlewares
 // [X] query parameters parsing
 // [X] multi-threaded http server
 // [X] threadpool for scalability
@@ -1004,6 +1005,7 @@ fn broadcastToRoom(room_name: []const u8, message: []const u8, io: std.Io) void 
 // --------------------------------------------------------- //
 
 // Send HTTP response with full spec compliance
+// consider error handling when implement fail for some reason
 fn sendHttpResponse(
     request: *std.http.Server.Request,
     status: HttpStatus,
@@ -1220,19 +1222,109 @@ fn getCurrentTimestamp(io: std.Io) i64 {
 
 // --------------------------------------------------------- //
 
+//
+// NOTE:
+// - Adding middleware may affect your requests/sec test
+//
+
+// Context passed through the middleware chain.
+const Context = struct {
+    request: *std.http.Server.Request,
+    io: std.Io,
+    conn_reader: *std.Io.Reader,
+    conn_writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    response_sent: bool = false,
+    stack: *anyopaque = undefined, // points to the MiddlewareStack
+};
+
+// A middleware component.
+const Middleware = struct {
+    name: []const u8,
+    handle: *const fn (ctx: *Context, next: NextFn) anyerror!void,
+};
+
+// Function type for the next middleware in the chain.
+const NextFn = *const fn (ctx: *Context) anyerror!void;
+
+// Stack that walks through the middleware chain.
+const MiddlewareStack = struct {
+    middlewares: []const Middleware,
+    index: usize,
+    ctx: *Context,
+    final_handler: *const fn (ctx: *Context) anyerror!void,
+
+    fn next(self: *MiddlewareStack) anyerror!void {
+        if (self.index < self.middlewares.len) {
+            const mw = self.middlewares[self.index];
+            self.index += 1;
+            try mw.handle(self.ctx, middlewareNext);
+        } else {
+            try self.final_handler(self.ctx);
+        }
+    }
+};
+
+fn middlewareNext(ctx: *Context) anyerror!void {
+    const stack: *MiddlewareStack = @alignCast(@ptrCast(ctx.stack));
+    return stack.next();
+}
+
+fn runMiddleware(ctx: *Context, middlewares: []const Middleware, final_handler: *const fn (ctx: *Context) anyerror!void) anyerror!void {
+    var stack = MiddlewareStack{
+        .middlewares = middlewares,
+        .index = 0,
+        .ctx = ctx,
+        .final_handler = final_handler,
+    };
+    ctx.stack = &stack;
+    try stack.next();
+}
+
+fn loggingMiddleware(ctx: *Context, next: NextFn) anyerror!void {
+    // const method = @tagName(ctx.request.head.method);
+    // const path = ctx.request.head.target;
+    // // uncomment below to see the log
+    // std.debug.print("[MIDDLEWARE] {s} {s}\n", .{ method, path });
+    try next(ctx);
+}
+
+fn headerMiddleware(ctx: *Context, next: NextFn) anyerror!void {
+    // Placeholder for adding response headers. For full support,
+    // extend `sendHttpResponse` to accept extra headers from the context.
+    // // uncomment below to see the log
+    // std.debug.print("[MIDDLEWARE] Adding custom header (simulated)\n", .{});
+    try next(ctx);
+}
+
+// Middleware chain for all /zig paths.
+const zig_middlewares: []const Middleware = &.{
+    .{ .name = "logging", .handle = loggingMiddleware },
+    .{ .name = "header", .handle = headerMiddleware },
+};
+
+// --------------------------------------------------------- //
+
 // Async client handler - new std.Io async I/O system (Zig 0.16.x)
-fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
-    defer stream.close(io);
+fn handleZigRoutes(ctx: *Context) anyerror!void {
+    defer ctx.response_sent = true; // assume a response is sent on success
 
-    var receive_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
-    var send_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+    const request = ctx.request;
+    const io = ctx.io;
+    const conn_reader = ctx.conn_reader;
+    const allocator = ctx.allocator;
 
-    // Async reader/writer wrappers for non-blocking operations
-    var conn_reader = stream.reader(io, &receive_buffer);
-    var conn_writer = stream.writer(io, &send_buffer);
-    var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+    const full_path = request.head.target;
+    const path = if (std.mem.indexOfScalar(u8, full_path, '?')) |qpos|
+        full_path[0..qpos]
+    else
+        full_path;
+    const query = if (std.mem.indexOfScalar(u8, full_path, '?')) |qpos|
+        full_path[qpos + 1 ..]
+    else
+        "";
 
-    // CORS configuration
+    const method = request.head.method;
     const cors_config = CorsConfig{
         .allow_origin = "*",
         .allow_methods = "GET, POST, PUT, DELETE, PATCH, OPTIONS",
@@ -1241,8 +1333,6 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
         .max_age = 86400,
         .expose_headers = "",
     };
-
-    // Cache configuration for static files
     const cache_config = CacheConfig{
         .public_ = true,
         .private_ = false,
@@ -1255,36 +1345,240 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
         .no_transform = false,
     };
 
-    // Handle multiple requests on same connection (keep-alive like C++)
-    // NOTE: perhaps handle sig handle (postpone)
+    if (std.mem.eql(u8, path, "/zig")) {
+        switch (method) {
+            .GET, .HEAD => {
+                const body = "home";
+                try sendHttpResponse(request, .ok, body, "text/plain", true, cors_config, cache_config, null);
+            },
+            .POST, .PUT, .PATCH => {
+                const content_length = getContentLength(request) orelse 0;
+                if (content_length > 0 and content_length <= CLIENT_REQUEST_BUFFER_SIZE) {
+                    var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+                    var total_read: usize = 0;
+                    while (total_read < content_length) {
+                        const bytes_read = conn_reader.readSliceShort(body_buffer[total_read..content_length]) catch break;
+                        if (bytes_read == 0) break;
+                        total_read += bytes_read;
+                    }
+                    var response_body: [256]u8 = undefined;
+                    const response_len = try std.fmt.bufPrint(&response_body, "received {d} bytes", .{total_read});
+                    try sendHttpResponse(request, .ok, response_len, "text/plain", true, cors_config, null, null);
+                } else {
+                    try sendHttpResponse(request, .ok, "no body", "text/plain", true, cors_config, null, null);
+                }
+            },
+            .DELETE => {
+                try sendHttpResponse(request, .no_content, "", "text/plain", true, cors_config, null, null);
+            },
+            else => {
+                try sendHttpResponse(request, .method_not_allowed, "Method Not Allowed", "text/plain", true, cors_config, null, null);
+            },
+        }
+        return;
+    } else if (std.mem.eql(u8, path, "/zig/json")) {
+        switch (method) {
+            .GET, .HEAD => {
+                const body = "{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}";
+                try sendHttpResponse(request, .ok, body, "application/json", true, cors_config, cache_config, null);
+            },
+            .POST, .PUT, .PATCH => {
+                const content_length = getContentLength(request) orelse 0;
+                if (content_length > 0 and content_length <= CLIENT_REQUEST_BUFFER_SIZE) {
+                    var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+                    var total_read: usize = 0;
+                    while (total_read < content_length) {
+                        const bytes_read = conn_reader.readSliceShort(body_buffer[total_read..content_length]) catch break;
+                        if (bytes_read == 0) break;
+                        total_read += bytes_read;
+                    }
+                    try sendHttpResponse(request, .ok, body_buffer[0..total_read], "application/json", true, cors_config, null, null);
+                } else {
+                    try sendHttpResponse(request, .ok, "{\"echo\":\"no body\"}", "application/json", true, cors_config, null, null);
+                }
+            },
+            .DELETE => {
+                try sendHttpResponse(request, .no_content, "", "text/plain", true, cors_config, null, null);
+            },
+            else => {
+                try sendHttpResponse(request, .method_not_allowed, "Method Not Allowed", "text/plain", true, cors_config, null, null);
+            },
+        }
+        return;
+    } else if (std.mem.eql(u8, path, "/zig/echo")) {
+        var response_body: std.ArrayList(u8) = .empty;
+        defer response_body.deinit(allocator);
+
+        if (query.len == 0) {
+            try response_body.appendSlice(allocator, "null");
+        } else {
+            try response_body.append(allocator, '{');
+            var first = true;
+            var pos: usize = 0;
+            while (pos < query.len) {
+                const amp_pos = std.mem.indexOfScalarPos(u8, query, pos, '&') orelse query.len;
+                const pair = query[pos..amp_pos];
+                if (std.mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
+                    const key = pair[0..eq_pos];
+                    const val = pair[eq_pos + 1 ..];
+                    if (!first) try response_body.appendSlice(allocator, ",");
+                    first = false;
+                    try response_body.append(allocator, '"');
+                    try response_body.appendSlice(allocator, key);
+                    try response_body.appendSlice(allocator, "\":");
+                    if (val.len == 0) {
+                        try response_body.appendSlice(allocator, "null");
+                    } else {
+                        try response_body.append(allocator, '"');
+                        try response_body.appendSlice(allocator, val);
+                        try response_body.append(allocator, '"');
+                    }
+                } else {
+                    if (!first) try response_body.appendSlice(allocator, ",");
+                    first = false;
+                    try response_body.append(allocator, '"');
+                    try response_body.appendSlice(allocator, pair);
+                    try response_body.appendSlice(allocator, "\":null");
+                }
+                pos = amp_pos + 1;
+            }
+            try response_body.append(allocator, '}');
+        }
+
+        try sendHttpResponse(request, .ok, response_body.items, "application/json", true, cors_config, null, null);
+        return;
+    } else if (std.mem.eql(u8, path, "/zig/upload")) {
+        if (method == .POST) {
+            const content_type = getContentType(request) orelse {
+                try sendHttpResponse(request, .bad_request, "Content-Type header required", "text/plain", true, cors_config, null, null);
+                return;
+            };
+            const boundary = extractBoundary(content_type) orelse {
+                try sendHttpResponse(request, .bad_request, "Invalid multipart/form-data Content-Type", "text/plain", true, cors_config, null, null);
+                return;
+            };
+            const content_length = getContentLength(request) orelse 0;
+            if (content_length == 0 or content_length > CLIENT_REQUEST_BUFFER_SIZE) {
+                try sendHttpResponse(request, .payload_too_large, "Payload too large", "text/plain", true, cors_config, null, null);
+                return;
+            }
+            var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+            var total_read: usize = 0;
+            while (total_read < content_length) {
+                const bytes_read = conn_reader.readSliceShort(body_buffer[total_read..content_length]) catch break;
+                if (bytes_read == 0) break;
+                total_read += bytes_read;
+            }
+            var parser = MultipartParser.init(allocator, boundary);
+            defer parser.deinit();
+            parser.parse(body_buffer[0..total_read]) catch {
+                try sendHttpResponse(request, .bad_request, "Failed to parse multipart data", "text/plain", true, cors_config, null, null);
+                return;
+            };
+            var response_json: std.ArrayList(u8) = .empty;
+            defer response_json.deinit(allocator);
+            try response_json.appendSlice(allocator, "{\"files\":[");
+            var first_file = true;
+            var i: usize = 0;
+            while (i < parser.fields.items.len) : (i += 1) {
+                const field = &parser.fields.items[i];
+                if (field.is_file) {
+                    const saved_path = saveUploadedFile(io, field.filename.?, field.data) catch {
+                        try sendHttpResponse(request, .internal_server_error, "Failed to save file", "text/plain", true, cors_config, null, null);
+                        return;
+                    };
+                    if (!first_file) try response_json.appendSlice(allocator, ",");
+                    first_file = false;
+                    var file_entry: [512]u8 = undefined;
+                    const entry_slice = try std.fmt.bufPrint(&file_entry, "{{\"name\":\"{s}\",\"size\":{d},\"path\":\"{s}\"}}", .{
+                        field.filename.?,
+                        field.data.len,
+                        saved_path,
+                    });
+                    try response_json.appendSlice(allocator, entry_slice);
+                }
+            }
+            try response_json.appendSlice(allocator, "],\"fields\":");
+            try response_json.append(allocator, '{');
+            var first_field = true;
+            i = 0;
+            while (i < parser.fields.items.len) : (i += 1) {
+                const field = &parser.fields.items[i];
+                if (!field.is_file) {
+                    if (!first_field) try response_json.appendSlice(allocator, ",");
+                    first_field = false;
+                    try response_json.append(allocator, '"');
+                    try response_json.appendSlice(allocator, field.name);
+                    try response_json.appendSlice(allocator, "\":\"");
+                    try response_json.appendSlice(allocator, field.data);
+                    try response_json.append(allocator, '"');
+                }
+            }
+            try response_json.appendSlice(allocator, "}}");
+            try sendHttpResponse(request, .ok, response_json.items, "application/json", true, cors_config, null, null);
+            return;
+        } else {
+            try sendHttpResponse(request, .method_not_allowed, "Method Not Allowed", "text/plain", true, cors_config, null, null);
+            return;
+        }
+    } else if (std.mem.startsWith(u8, path, "/zig/")) {
+        var response_body: std.ArrayList(u8) = .empty;
+        defer response_body.deinit(allocator);
+        try response_body.appendSlice(allocator, "value path: ");
+        try response_body.appendSlice(allocator, path);
+        try sendHttpResponse(request, .ok, response_body.items, "text/plain", true, cors_config, cache_config, null);
+        return;
+    } else {
+        // No dynamic route matched; try static file (from ./public)
+        if (std.mem.startsWith(u8, path, "/")) {
+            const sub_path = path[1..];
+            const file_served = serveStaticFile(request, sub_path, io) catch false;
+            if (file_served) return;
+        }
+        try sendHttpResponse(request, .not_found, "Not Found", "text/plain", true, cors_config, null, null);
+        return;
+    }
+}
+
+// Middleware integration included
+fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
+    defer stream.close(io);
+
+    var receive_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+    var send_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
+
+    var conn_reader = stream.reader(io, &receive_buffer);
+    var conn_writer = stream.writer(io, &send_buffer);
+    var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+
+    const cors_config = CorsConfig{
+        .allow_origin = "*",
+        .allow_methods = "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+        .allow_headers = "Content-Type, Authorization, X-Requested-With, Accept",
+        .allow_credentials = false,
+        .max_age = 86400,
+        .expose_headers = "",
+    };
+
     while (true) {
-        // Async receive: suspends until data available or connection closed
         var request = server.receiveHead() catch |err| {
             if (err == error.HttpConnectionClosing) break;
             if (err == error.ConnectionResetByPeer) break;
             break;
         };
         const full_path = request.head.target;
-
-        // Split path and query string
         const path = if (std.mem.indexOfScalar(u8, full_path, '?')) |qpos|
             full_path[0..qpos]
         else
             full_path;
-        const query = if (std.mem.indexOfScalar(u8, full_path, '?')) |qpos|
-            full_path[qpos + 1 ..]
-        else
-            "";
-
-        // Get HTTP method
         const method = request.head.method;
 
-        // Check for WebSocket upgrade request (/chat/{room_name})
-        const is_chat_path = std.mem.startsWith(u8, path, "/chat/");
+        // Check for WebSocket upgrade request (handled separately, before middleware)
+        const is_chat_path = std.mem.startsWith(u8, path, "/zig/chat/");
         const is_get_method = method == .GET;
         if (is_chat_path and is_get_method) {
             // Extract room name from path
-            const room_name = path[6..];
+            const room_name = path[10..]; // "/zig/chat/".len = 10
             if (room_name.len == 0) {
                 sendHttpResponse(
                     &request,
@@ -1313,9 +1607,7 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             if (is_upgrade and sec_ws_key != null) {
                 // Perform WebSocket handshake
                 var accept_buffer: [64]u8 = undefined;
-                const accept_key = computeWebSocketAccept(sec_ws_key.?, &accept_buffer) catch {
-                    break;
-                };
+                const accept_key = computeWebSocketAccept(sec_ws_key.?, &accept_buffer) catch break;
 
                 // Send handshake response
                 var handshake_response: [512]u8 = undefined;
@@ -1413,468 +1705,62 @@ fn handleClient(stream: std.Io.net.Stream, io: std.Io) void {
             // Not a WebSocket request, fall through to normal HTTP
         }
 
-        // Handle OPTIONS request (CORS preflight)
+        // Handle OPTIONS preflight (CORS)
         if (method == .OPTIONS) {
             handleOptionsRequest(&request, cors_config) catch break;
             continue;
         }
 
-        // Dynamic route handling FIRST (like C++ reference - check routes before static files)
         var handled = false;
-        if (std.mem.eql(u8, path, "/zig")) {
-            // Handle different methods for /zig endpoint
-            switch (method) {
-                .GET, .HEAD => {
-                    const body = "home";
-                    sendHttpResponse(
-                        &request,
-                        .ok,
-                        body,
-                        "text/plain",
-                        true,
-                        cors_config,
-                        cache_config,
-                        null,
-                    ) catch break;
-                },
-                .POST, .PUT, .PATCH => {
-                    // Accept body data - read from server.in
-                    const content_length = getContentLength(&request) orelse 0;
-                    if (content_length > 0 and content_length <= CLIENT_REQUEST_BUFFER_SIZE) {
-                        var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
-                        var total_read: usize = 0;
-                        while (total_read < content_length) {
-                            const bytes_read = conn_reader.interface.readSliceShort(body_buffer[total_read..content_length]) catch break;
-                            if (bytes_read == 0) break;
-                            total_read += bytes_read;
-                        }
-                        var response_body: [256]u8 = undefined;
-                        const response_len = std.fmt.bufPrint(&response_body, "received {d} bytes", .{total_read}) catch break;
-                        sendHttpResponse(
-                            &request,
-                            .ok,
-                            response_len,
-                            "text/plain",
-                            true,
-                            cors_config,
-                            null,
-                            null,
-                        ) catch break;
-                    } else {
-                        sendHttpResponse(
-                            &request,
-                            .ok,
-                            "no body",
-                            "text/plain",
-                            true,
-                            cors_config,
-                            null,
-                            null,
-                        ) catch break;
-                    }
-                },
-                .DELETE => {
-                    sendHttpResponse(
-                        &request,
-                        .no_content,
-                        "",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                },
-                else => {
-                    sendHttpResponse(
-                        &request,
-                        .method_not_allowed,
-                        "Method Not Allowed",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                },
-            }
 
-            handled = true;
-        } else if (std.mem.eql(u8, path, "/zig/json")) {
-            // Handle different methods for /zig/json endpoint
-            switch (method) {
-                .GET, .HEAD => {
-                    const body = "{\"string\":\"string\",\"decimal\":3.14,\"round\":69,\"boolean\":true}";
-                    sendHttpResponse(
-                        &request,
-                        .ok,
-                        body,
-                        "application/json",
-                        true,
-                        cors_config,
-                        cache_config,
-                        null,
-                    ) catch break;
-                },
-                .POST, .PUT, .PATCH => {
-                    // Accept JSON body and echo back - read from server.in
-                    const content_length = getContentLength(&request) orelse 0;
-                    if (content_length > 0 and content_length <= CLIENT_REQUEST_BUFFER_SIZE) {
-                        var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
-                        var total_read: usize = 0;
-                        while (total_read < content_length) {
-                            const bytes_read = conn_reader.interface.readSliceShort(body_buffer[total_read..content_length]) catch break;
-                            if (bytes_read == 0) break;
-                            total_read += bytes_read;
-                        }
-                        sendHttpResponse(
-                            &request,
-                            .ok,
-                            body_buffer[0..total_read],
-                            "application/json",
-                            true,
-                            cors_config,
-                            null,
-                            null,
-                        ) catch break;
-                    } else {
-                        sendHttpResponse(
-                            &request,
-                            .ok,
-                            "{\"echo\":\"no body\"}",
-                            "application/json",
-                            true,
-                            cors_config,
-                            null,
-                            null,
-                        ) catch break;
-                    }
-                },
-                .DELETE => {
-                    sendHttpResponse(
-                        &request,
-                        .no_content,
-                        "",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                },
-                else => {
-                    sendHttpResponse(
-                        &request,
-                        .method_not_allowed,
-                        "Method Not Allowed",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                },
-            }
-
-            handled = true;
-        } else if (std.mem.eql(u8, path, "/zig/echo")) {
-            // Build JSON response for query parameters
-            var response_body: std.ArrayList(u8) = .empty;
-            defer response_body.deinit(std.heap.smp_allocator);
-
-            if (query.len == 0) {
-                // No params → return null
-                response_body.appendSlice(std.heap.smp_allocator, "null") catch break;
-            } else {
-                // All params as JSON object
-                response_body.append(std.heap.smp_allocator, '{') catch break;
-                var first = true;
-                var pos: usize = 0;
-                while (pos < query.len) {
-                    const amp_pos = std.mem.indexOfScalarPos(u8, query, pos, '&') orelse query.len;
-                    const pair = query[pos..amp_pos];
-                    if (std.mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
-                        const key = pair[0..eq_pos];
-                        const val = pair[eq_pos + 1 ..];
-                        if (!first) response_body.appendSlice(std.heap.smp_allocator, ",") catch break;
-                        first = false;
-                        response_body.append(std.heap.smp_allocator, '"') catch break;
-                        response_body.appendSlice(std.heap.smp_allocator, key) catch break;
-                        response_body.appendSlice(std.heap.smp_allocator, "\":") catch break;
-                        if (val.len == 0) {
-                            response_body.appendSlice(std.heap.smp_allocator, "null") catch break;
-                        } else {
-                            response_body.append(std.heap.smp_allocator, '"') catch break;
-                            response_body.appendSlice(std.heap.smp_allocator, val) catch break;
-                            response_body.append(std.heap.smp_allocator, '"') catch break;
-                        }
-                    } else {
-                        if (!first) response_body.appendSlice(std.heap.smp_allocator, ",") catch break;
-                        first = false;
-                        response_body.append(std.heap.smp_allocator, '"') catch break;
-                        response_body.appendSlice(std.heap.smp_allocator, pair) catch break;
-                        response_body.appendSlice(std.heap.smp_allocator, "\":null") catch break;
-                    }
-
-                    pos = amp_pos + 1;
-                }
-
-                response_body.append(std.heap.smp_allocator, '}') catch break;
-            }
-
-            sendHttpResponse(
-                &request,
-                .ok,
-                response_body.items,
-                "application/json",
-                true,
-                cors_config,
-                null,
-                null,
-            ) catch break;
-
-            handled = true;
-        } else if (std.mem.eql(u8, path, "/zig/upload")) {
-            // Handle multipart/form-data file upload
-            if (method == .POST) {
-                const content_type = getContentType(&request) orelse {
-                    sendHttpResponse(
-                        &request,
-                        .bad_request,
-                        "Content-Type header required",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                    handled = true;
-                    continue;
-                };
-
-                const boundary = extractBoundary(content_type) orelse {
-                    sendHttpResponse(
-                        &request,
-                        .bad_request,
-                        "Invalid multipart/form-data Content-Type",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                    handled = true;
-                    continue;
-                };
-
-                const content_length = getContentLength(&request) orelse 0;
-                if (content_length == 0 or content_length > CLIENT_REQUEST_BUFFER_SIZE) {
-                    sendHttpResponse(
-                        &request,
-                        .payload_too_large,
-                        "Payload too large",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                    handled = true;
-                    continue;
-                }
-
-                var body_buffer: [CLIENT_REQUEST_BUFFER_SIZE]u8 = undefined;
-                var total_read: usize = 0;
-                while (total_read < content_length) {
-                    const bytes_read = conn_reader.interface.readSliceShort(body_buffer[total_read..content_length]) catch break;
-                    if (bytes_read == 0) break;
-                    total_read += bytes_read;
-                }
-                var parser = MultipartParser.init(std.heap.smp_allocator, boundary);
-                defer parser.deinit();
-
-                parser.parse(body_buffer[0..total_read]) catch {
-                    sendHttpResponse(
-                        &request,
-                        .bad_request,
-                        "Failed to parse multipart data",
-                        "text/plain",
-                        true,
-                        cors_config,
-                        null,
-                        null,
-                    ) catch break;
-                    handled = true;
-                    continue;
-                };
-
-                var response_json: std.ArrayList(u8) = .empty;
-                defer response_json.deinit(std.heap.smp_allocator);
-
-                response_json.appendSlice(std.heap.smp_allocator, "{\"files\":[") catch break;
-                var first_file = true;
-                var i: usize = 0;
-                while (i < parser.fields.items.len) : (i += 1) {
-                    const field = &parser.fields.items[i];
-
-                    if (field.is_file) {
-                        const saved_path = saveUploadedFile(io, field.filename.?, field.data) catch {
-                            sendHttpResponse(
-                                &request,
-                                .internal_server_error,
-                                "Failed to save file",
-                                "text/plain",
-                                true,
-                                cors_config,
-                                null,
-                                null,
-                            ) catch break;
-                            handled = true;
-                            continue;
-                        };
-
-                        if (!first_file) response_json.appendSlice(std.heap.smp_allocator, ",") catch break;
-                        first_file = false;
-                        var file_entry: [512]u8 = undefined;
-                        const entry_slice = std.fmt.bufPrint(&file_entry, "{{\"name\":\"{s}\",\"size\":{d},\"path\":\"{s}\"}}", .{
-                            field.filename.?,
-                            field.data.len,
-                            saved_path,
-                        }) catch break;
-
-                        response_json.appendSlice(std.heap.smp_allocator, entry_slice) catch break;
-                    }
-                }
-
-                response_json.appendSlice(std.heap.smp_allocator, "],\"fields\":") catch break;
-
-                // Add non-file fields as JSON object
-                response_json.append(std.heap.smp_allocator, '{') catch break;
-                var first_field = true;
-                i = 0;
-                while (i < parser.fields.items.len) : (i += 1) {
-                    const field = &parser.fields.items[i];
-                    if (!field.is_file) {
-                        if (!first_field) response_json.appendSlice(std.heap.smp_allocator, ",") catch break;
-                        first_field = false;
-                        response_json.append(std.heap.smp_allocator, '"') catch break;
-                        response_json.appendSlice(std.heap.smp_allocator, field.name) catch break;
-                        response_json.appendSlice(std.heap.smp_allocator, "\":\"") catch break;
-                        response_json.appendSlice(std.heap.smp_allocator, field.data) catch break;
-                        response_json.append(std.heap.smp_allocator, '"') catch break;
-                    }
-                }
-
-                response_json.appendSlice(std.heap.smp_allocator, "}}") catch break;
-
-                sendHttpResponse(
-                    &request,
-                    .ok,
-                    response_json.items,
-                    "application/json",
-                    true,
-                    cors_config,
-                    null,
-                    null,
-                ) catch break;
-
-                handled = true;
-            } else {
-                sendHttpResponse(
-                    &request,
-                    .method_not_allowed,
-                    "Method Not Allowed",
-                    "text/plain",
-                    true,
-                    cors_config,
-                    null,
-                    null,
-                ) catch break;
-
-                handled = true;
-            }
-        } else if (std.mem.startsWith(u8, path, "/zig/")) {
-            // Dynamic path routing: /zig/{path1}/{path2}/...
-            var response_body: std.ArrayList(u8) = .empty;
-            defer response_body.deinit(std.heap.smp_allocator);
-
-            // Build: "value path: /zig/{segments}"
-            response_body.appendSlice(std.heap.smp_allocator, "value path: ") catch break;
-            response_body.appendSlice(std.heap.smp_allocator, path) catch break;
-
-            sendHttpResponse(
-                &request,
-                .ok,
-                response_body.items,
-                "text/plain",
-                true,
-                cors_config,
-                cache_config,
-                null,
-            ) catch break;
-
-            handled = true;
-        } else if (std.mem.eql(u8, path, "/api/status")) {
-            // Health check endpoint
-            const body = "{\"status\":\"ok\",\"version\":\"0.1.0\"}";
-
-            sendHttpResponse(
-                &request,
-                .ok,
-                body,
-                "application/json",
-                true,
-                cors_config,
-                null,
-                null,
-            ) catch break;
-
-            handled = true;
-        } else if (std.mem.eql(u8, path, "/api/time")) {
-            // Current time endpoint - using std.Io.Timestamp
-            var time_buf: [64]u8 = undefined;
-            const timestamp = getCurrentTimestamp(io);
-            const time_str = std.fmt.bufPrint(&time_buf, "{{\"timestamp\":{d}}}", .{timestamp}) catch break;
-
-            sendHttpResponse(
-                &request,
-                .ok,
-                time_str,
-                "application/json",
-                true,
-                cors_config,
-                null,
-                null,
-            ) catch break;
-
-            handled = true;
+        // Apply middleware for /zig paths
+        if (std.mem.startsWith(u8, path, "/zig")) {
+            var ctx = Context{
+                .request = &request,
+                .io = io,
+                .conn_reader = &conn_reader.interface,
+                .conn_writer = &conn_writer.interface,
+                .allocator = std.heap.smp_allocator,
+                .response_sent = false,
+            };
+            runMiddleware(&ctx, zig_middlewares, handleZigRoutes) catch {}; // ignore error, handled by ctx.response_sent
+            // If middleware or final handler sent a response, we consider it handled.
+            handled = ctx.response_sent;
         }
 
-        // Try static files ONLY if no dynamic route matched (like C++ reference else block)
+        // If not handled by middleware, process other routes (non-/zig) and static files
         if (!handled) {
-            if (std.mem.startsWith(u8, path, "/")) {
-                const sub_path = path[1..];
-                const file_served = serveStaticFile(&request, sub_path, io) catch false;
-                if (file_served) {
-                    // File served successfully, continue to next request
-                    continue;
-                }
+            // The rest of the original routing logic (non-/zig paths)
+            if (std.mem.eql(u8, path, "/zig/json/status")) {
+                const body = "{\"status\":\"ok\",\"version\":\"0.1.0\"}";
+                sendHttpResponse(&request, .ok, body, "application/json", true, cors_config, null, null) catch break;
+                handled = true;
+            } else if (std.mem.eql(u8, path, "/zig/json/time")) {
+                var time_buf: [64]u8 = undefined;
+                const timestamp = getCurrentTimestamp(io);
+                const time_str = std.fmt.bufPrint(&time_buf, "{{\"timestamp\":{d}}}", .{timestamp}) catch break;
+                sendHttpResponse(&request, .ok, time_str, "application/json", true, cors_config, null, null) catch break;
+                handled = true;
             }
 
-            // No route matched and static file not found → send 404
-            sendHttpResponse(
-                &request,
-                .not_found,
-                "Not Found",
-                "text/plain",
-                true,
-                cors_config,
-                null,
-                null,
-            ) catch break;
+            if (!handled) {
+                // Try static files
+                if (std.mem.startsWith(u8, path, "/")) {
+                    const sub_path = path[1..];
+                    const file_served = serveStaticFile(&request, sub_path, io) catch false;
+                    if (file_served) {
+                        handled = true;
+                    }
+                }
+
+                if (!handled) {
+                    sendHttpResponse(&request, .not_found, "Not Found", "text/plain", true, cors_config, null, null) catch break;
+                }
+            }
         }
 
-        // REMOVED: discardBody() is private - respond() handles it internally?
+        // Continue to next request on keep-alive
+        // discardBody() is private - respond(); does it handles internally?
     }
 }
 
@@ -1893,17 +1779,19 @@ fn runServer(io: std.Io) !void {
     // Initialize global WebSocket room map
     g_websocket_rooms = std.StringHashMap(WebSocketRoom).init(std.heap.smp_allocator);
     g_ws_allocator = std.heap.smp_allocator;
+    // might simplified
 
     std.debug.print("backend_zig_async: run on {s}:{d}\n", .{ ADDRESS_IP, ADDRESS_PORT });
-    std.debug.print("  - HTTP endpoint: /zig\n", .{});
-    std.debug.print("  - JSON endpoint: /zig/json\n", .{});
-    std.debug.print("  - Echo endpoint: /zig/echo?text=hello (query parameters)\n", .{});
-    std.debug.print("  - Dynamic path: /zig/{{path1}}/{{path2}}/... (except /zig/json)\n", .{});
-    std.debug.print("  - WebSocket endpoint: /chat/{{room_name}} (per room broadcast)\n", .{});
-    std.debug.print("  - Static files from ./public at root (e.g., /image.jpg)\n", .{});
-    std.debug.print("  - File upload: /zig/upload (multipart/form-data) → ./public/u\n", .{});
-    std.debug.print("  - Health check: /api/status\n", .{});
-    std.debug.print("  - Time endpoint: /api/time\n", .{});
+    std.debug.print("  - HTTP endpoint                           : /zig\n", .{});
+    std.debug.print("  - JSON endpoint                           : /zig/json\n", .{});
+    std.debug.print("  - Time endpoint                           : /zig/json/time\n", .{});
+    std.debug.print("  - Health check                            : /zig/json/status\n", .{});
+    std.debug.print("  - Echo endpoint                           : /zig/echo?text=hello (query parameters)\n", .{});
+    std.debug.print("  - WebSocket endpoint                      : /zig/chat/{{room_name}} (per room broadcast)\n", .{});
+    std.debug.print("  - File upload                             : /zig/upload (multipart/form-data) -> ./public/u\n", .{});
+    std.debug.print("  - Dynamic path                            : /zig/{{path1}}/{{path2}}/... (except /zig/json)\n", .{});
+    std.debug.print("  - Static files from ./public at root, e.g.: /favicon.svg (make it sure the file exists on that directory)\n", .{});
+    std.debug.print("  // --------------------------------------------------------- //\n", .{});
     std.debug.print("  - CORS enabled for all endpoints\n", .{});
     std.debug.print("  - Range requests supported for static files\n", .{});
     std.debug.print("  - Full HTTP spec: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\n", .{});
@@ -1934,7 +1822,7 @@ pub fn main() !void {
         .{ .limited = WORKER_THREADS_TARGET };
 
     // Threaded I/O with concurrent task support - new std.Io async system
-    // async_limit auto-detected from CPU count if not specified
+    // async_limit auto-detected from CPU count if not provided
     var io = std.Io.Threaded.init(std.heap.smp_allocator, .{
         .stack_size = std.Thread.SpawnConfig.default_stack_size,
         .concurrent_limit = concurrent_limit,
@@ -1952,11 +1840,11 @@ pub fn main() !void {
 // Running 10s test @ http://localhost:9007/zig
 //   6 threads and 100 connections
 //   Thread Stats   Avg      Stdev     Max   +/- Stdev
-//     Latency   325.98us  655.33us  25.67ms   93.43%
-//     Req/Sec    61.26k    14.91k  135.91k    71.55%
-//   3663322 requests in 10.10s, 1.18GB read
-// Requests/sec: 362732.80
-// Transfer/sec:    120.04MB
+//     Latency   253.55us  443.18us  23.02ms   96.15%
+//     Req/Sec    58.69k    15.09k   83.05k    49.83%
+//   3526361 requests in 10.10s, 1.14GB read
+// Requests/sec: 349165.15
+// Transfer/sec:    115.55MB
 //
 // ASYNC VERIFICATION (Zig 0.16.x - std.Io):
 // - std.Io.Threaded provides async I/O backend with thread pool
@@ -2013,4 +1901,3 @@ pub fn main() !void {
 // Response format:
 // {"files":[{"name":"file.txt","size":1024,"path":"./public/u/file.txt"}],"fields":{"description":"My test file"}}
 //
-
