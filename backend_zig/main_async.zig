@@ -2,7 +2,7 @@ const std = @import("std");
 
 const ADDRESS_IP: []const u8 = "0.0.0.0";
 const ADDRESS_PORT: u16 = 9007;
-const WORKER_THREADS_TARGET: usize = 0;
+const WORKER_THREADS_TARGET: usize = 0; // this doesn't represent hardware thread/s
 
 const CLIENT_REQUEST_BUFFER_SIZE: usize = 8192;
 
@@ -1819,7 +1819,7 @@ pub fn main() !void {
     const concurrent_limit: std.Io.Limit = if (WORKER_THREADS_TARGET == 0)
         .unlimited
     else
-        .{ .limited = WORKER_THREADS_TARGET };
+        .{ .limited(WORKER_THREADS_TARGET) };
 
     // Threaded I/O with concurrent task support - new std.Io async system
     // async_limit auto-detected from CPU count if not provided
