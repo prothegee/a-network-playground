@@ -54,13 +54,13 @@ playground to apply network application.
 - Endpoint: `/{lang+framework-if_any}/json`
 - Content-Type: `application/json`
 
-### 🏆 Ranking by Throughput (Requests/sec)
+### Ranking by Throughput (Requests/sec)
 
 | Rank | lang                    | requests/sec | transfer/sec | latency avg |
 | :--: | :--                     | :--          | :--          | :--         |
-| 🥇   | Rust (STL)              | **267,551**  | 39.55MB      | 190.69us    |
-| 🥈   | C (STL)                 | **267,147**  | 39.49MB      | 191.02us    |
-| 🥉   | C++ (STL)               | **266,129**  | 39.34MB      | 192.00us    |
+| 1    | Rust (STL)              | **267,551**  | 39.55MB      | 190.69us    |
+| 2    | C (STL)                 | **267,147**  | 39.49MB      | 191.02us    |
+| 3    | C++ (STL)               | **266,129**  | 39.34MB      | 192.00us    |
 | 4    | Zig (STL)               | **265,204**  | 39.20MB      | 193.01us    |
 | 5    | Zig (STL) async*        | **215,607**  | **84.30MB**  | 249.87us    |
 | 6    | Go (STL)                | **209,554**  | 33.77MB      | 305.40us    |
@@ -115,9 +115,13 @@ playground to apply network application.
 ### Key Observations
 
 1. **Top 4 are tightly clustered**: Rust, C, C++, and Zig (STL) all deliver ~265–267k req/sec with sub-200µs avg latency — essentially equivalent performance for this JSON endpoint.
+
 2. **Go is ~22% slower** than the top tier but still solid at ~209k req/sec; slightly higher latency variance.
+
 3. **Zig async** shows lower req/sec but **2× transfer volume**, suggesting it serves a larger/more complex JSON payload — throughput by *bytes/sec* is actually highest here.
+
 4. **C++ async** has significantly higher latency (1.18ms avg) and lowest throughput — likely due to async overhead or different implementation strategy; may benefit from tuning.
+
 5. **Latency consistency**: Most implementations keep >63% of requests within 1 stdev; Zig variants show higher `% +/- stdev`, indicating more variable tail latency.
 
 <br>
