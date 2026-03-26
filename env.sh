@@ -63,11 +63,13 @@ function _build_backend_rs() {
 
 function _build_backend_zig() {
     echo "backend_zig";
-    zig build-exe backend_zig/main.zig --name backend_zig.o;
+    zig build-exe backend_zig/main.zig --name backend_zig.o \
+        -Doptimize=ReleaseSafe;
 }
 function _build_backend_zig_async() {
     echo "backend_zig_async";
-    zig build-exe backend_zig/main_async.zig --name backend_zig_async.o;
+    zig build-exe backend_zig/main_async.zig --name backend_zig_async.o \
+        -Doptimize=ReleaseSafe;
 }
 
 # --------------------------------------------------------- #
