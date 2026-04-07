@@ -38,6 +38,8 @@ public
 *.dll
 *.lib
 
+/*.*.o
+
 ##
 ## file: include
 ##
