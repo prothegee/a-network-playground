@@ -33,7 +33,7 @@ defmodule HttpServer do
 
   @ip {0, 0, 0, 0}
   @port 9007
-  @max_clients 1024
+  @max_clients 1024 * 4
 
   ## --------------------------------------------------------- ##
 
@@ -211,7 +211,7 @@ defmodule HttpServer do
           {:ok, data} ->
             skip_headers_and_body(socket, buffer <> data)
 
-          {:error, _} = error ->
+          {:error, _} = _error ->
             # On error, just return what we have
             {false, buffer}
         end
